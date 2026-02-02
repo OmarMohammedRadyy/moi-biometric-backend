@@ -1,17 +1,18 @@
 # استخدم Python 3.11 (أفضل توافق مع DeepFace)
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # تثبيت المتطلبات للنظام
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # إعداد مجلد العمل
 WORKDIR /app
@@ -32,6 +33,7 @@ RUN mkdir -p uploads
 # تعيين المتغيرات البيئية
 ENV HOST=0.0.0.0
 ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
 
 # فتح المنفذ
 EXPOSE 8000
