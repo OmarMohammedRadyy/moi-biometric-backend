@@ -8,7 +8,7 @@ import sys
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import StaticPool, NullPool
 
 # Get database URL from environment
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./moi_biometric.db")
@@ -20,53 +20,54 @@ if DATABASE_URL.startswith("postgres://"):
 # Determine if using SQLite
 is_sqlite = DATABASE_URL.startswith("sqlite")
 
-print(f"📊 Database type: {'SQLite' if is_sqlite else 'PostgreSQL'}")
+print(f"📊 Database type: {'SQLite' if is_sqlite else 'PostgreSQL'}", flush=True)
+
+# Create base class for models FIRST
+Base = declarative_base()
 
 # Create engine based on database type
-try:
-    if is_sqlite:
-        # SQLite configuration
-        engine = create_engine(
-            DATABASE_URL,
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-            echo=False
-        )
-        
-        # Enable foreign keys for SQLite
-        @event.listens_for(engine, "connect")
-        def set_sqlite_pragma(dbapi_connection, connection_record):
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
-    else:
-        # PostgreSQL configuration
-        engine = create_engine(
-            DATABASE_URL,
-            pool_size=5,
-            max_overflow=10,
-            pool_timeout=30,
-            pool_recycle=1800,
-            pool_pre_ping=True,  # Test connections before use
-            echo=False
-        )
-    print("✅ Database engine created successfully")
-except Exception as e:
-    print(f"❌ Failed to create database engine: {e}")
-    sys.exit(1)
+engine = None
+
+def create_db_engine():
+    global engine
+    try:
+        if is_sqlite:
+            # SQLite configuration
+            engine = create_engine(
+                DATABASE_URL,
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+                echo=False
+            )
+        else:
+            # PostgreSQL configuration - use NullPool to avoid connection issues
+            engine = create_engine(
+                DATABASE_URL,
+                poolclass=NullPool,  # Create new connection each time
+                echo=False
+            )
+        print("✅ Database engine created", flush=True)
+        return engine
+    except Exception as e:
+        print(f"❌ Failed to create engine: {e}", flush=True)
+        return None
+
+# Create engine immediately
+engine = create_db_engine()
 
 # Create session factory
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Create base class for models
-Base = declarative_base()
+if engine:
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+else:
+    SessionLocal = None
 
 
 def get_db():
     """
     Dependency for getting database session.
-    Yields a session and ensures it's closed after use.
     """
+    if SessionLocal is None:
+        raise Exception("Database not initialized")
     db = SessionLocal()
     try:
         yield db
@@ -77,24 +78,36 @@ def get_db():
 def init_db():
     """
     Initialize database tables.
-    Creates all tables defined in the models.
     """
+    global engine, SessionLocal
+    
+    print("🔄 init_db() called...", flush=True)
+    
+    if engine is None:
+        print("⚠️ Engine is None, trying to create...", flush=True)
+        engine = create_db_engine()
+        if engine:
+            SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    
+    if engine is None:
+        print("❌ Cannot initialize - no engine", flush=True)
+        return
+    
     try:
-        print("🔄 Initializing database...")
-        from models import Visitor  # Import here to avoid circular imports
+        print("📥 Importing models...", flush=True)
+        from models import Visitor
         
-        # Test connection first
+        print("🔗 Testing connection...", flush=True)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-            print("✅ Database connection test passed")
+        print("✅ Connection OK", flush=True)
         
-        # Create tables
+        print("📋 Creating tables...", flush=True)
         Base.metadata.create_all(bind=engine)
-        print(f"✅ Database initialized: {'SQLite' if is_sqlite else 'PostgreSQL'}")
+        print(f"✅ Database ready: {'SQLite' if is_sqlite else 'PostgreSQL'}", flush=True)
+        
     except Exception as e:
-        print(f"❌ Database initialization failed: {e}")
-        # Don't crash - let the app start anyway
-        # The database might come up later
+        print(f"❌ init_db error: {e}", flush=True)
 
 
 def get_db_info():
@@ -103,5 +116,6 @@ def get_db_info():
     """
     return {
         "type": "SQLite" if is_sqlite else "PostgreSQL",
-        "url": DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL
+        "url": DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL,
+        "connected": engine is not None
     }
