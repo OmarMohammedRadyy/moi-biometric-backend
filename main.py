@@ -130,11 +130,16 @@ def compare_embeddings(embedding1: list, embedding2: list) -> float:
 async def startup_event():
     """Initialize database tables on startup"""
     print("🚀 Starting MOI Biometric System...")
-    init_db()
-    print("✅ Database initialized successfully!")
+    try:
+        init_db()
+        print("✅ Database initialized successfully!")
+    except Exception as e:
+        print(f"⚠️ Database initialization warning: {e}")
+        print("⚠️ App will continue - database might come up later")
     print(f"🧠 Face Recognition Model: {FACE_MODEL}")
     print(f"📏 Distance Metric: {DISTANCE_METRIC}")
     print(f"🎯 Match Threshold: {MATCH_THRESHOLD}")
+
 
 
 # ==================== Health Check ====================
