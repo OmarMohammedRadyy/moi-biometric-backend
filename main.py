@@ -432,17 +432,9 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", 8000))
     
-    # Check if running in production (Railway sets RAILWAY_ENVIRONMENT)
-    is_production = os.getenv("RAILWAY_ENVIRONMENT") is not None
+    print(f"🔒 Starting on http://{host}:{port}", flush=True)
     
-    print(f"🔒 MOI Biometric System starting on http://{host}:{port}")
-    print(f"📦 Environment: {'Production' if is_production else 'Development'}")
-    
-    uvicorn.run(
-        "main:app",
-        host=host,
-        port=port,
-        reload=not is_production,  # Disable reload in production
-        workers=1
-    )
+    # Run directly - no reload in production
+    uvicorn.run(app, host=host, port=port)
+
 
