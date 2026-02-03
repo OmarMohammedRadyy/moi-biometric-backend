@@ -167,6 +167,83 @@ async def health_check():
     }
 
 
+# ==================== Authentication ====================
+
+from auth import authenticate_user, verify_token, revoke_token
+from pydantic import BaseModel
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class TokenResponse(BaseModel):
+    token: str
+    username: str
+    message: str
+
+
+@app.post("/api/auth/login", response_model=TokenResponse, tags=["Authentication"])
+async def login(request: LoginRequest):
+    """
+    Login with username and password.
+    Returns a token for authenticated requests.
+    """
+    token = authenticate_user(request.username, request.password)
+    
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="اسم المستخدم أو كلمة المرور غير صحيحة"
+        )
+    
+    return {
+        "token": token,
+        "username": request.username,
+        "message": "تم تسجيل الدخول بنجاح"
+    }
+
+
+@app.post("/api/auth/logout", tags=["Authentication"])
+async def logout(token: str = Form(...)):
+    """Logout and invalidate token"""
+    revoke_token(token)
+    return {"message": "تم تسجيل الخروج بنجاح"}
+
+
+@app.get("/api/auth/verify", tags=["Authentication"])
+async def verify_auth(token: str):
+    """Verify if a token is valid"""
+    username = verify_token(token)
+    
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="الجلسة غير صالحة أو منتهية"
+        )
+    
+    return {
+        "valid": True,
+        "username": username
+    }
+
+
+@app.get("/api/auth/me", tags=["Authentication"])
+async def get_current_user(token: str):
+    """Get current authenticated user info"""
+    username = verify_token(token)
+    
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="غير مصرح"
+        )
+    
+    return {
+        "username": username,
+        "role": "admin"
+    }
+
+
 # ==================== Visitor Management (Admin) ====================
 
 @app.post("/api/visitors", response_model=VisitorResponse, tags=["Admin"])
