@@ -78,13 +78,22 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS Configuration - Allow all origins for production
+# CORS Configuration
+ALLOWED_ORIGINS = [
+    "https://moi-biometric-frontend.vercel.app",
+    "https://moi-biometric-frontend-git-main-omars-projects-5731842e.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Mount uploads directory
