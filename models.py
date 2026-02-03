@@ -115,7 +115,8 @@ class Visitor(Base):
         full_name: Visitor's full name
         passport_number: Unique passport number
         visa_status: Current visa status (e.g., "Valid", "Expired", "Tourist", "Work")
-        photo_path: Path to the stored photo file
+        photo_path: Path to the stored photo file (legacy, kept for compatibility)
+        photo_base64: Photo stored as base64 string (for cloud deployment)
         face_encoding: 512-dimensional face encoding stored as JSON array
         created_at: Timestamp when record was created
         updated_at: Timestamp when record was last updated
@@ -126,7 +127,8 @@ class Visitor(Base):
     full_name = Column(String(255), nullable=False)
     passport_number = Column(String(50), unique=True, nullable=False, index=True)
     visa_status = Column(String(100), nullable=False)
-    photo_path = Column(String(500), nullable=False)
+    photo_path = Column(String(500), nullable=True)  # Legacy field
+    photo_base64 = Column(Text, nullable=True)  # New: stores photo as base64
     face_encoding = Column(JSON, nullable=False)  # Stores 512-d vector (Facenet512) as JSON array
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

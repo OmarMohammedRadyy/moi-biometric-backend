@@ -80,7 +80,8 @@ class ScanLogVisitor(BaseModel):
     full_name: str
     passport_number: str
     visa_status: str
-    photo_path: str
+    photo_path: Optional[str] = None
+    photo_base64: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -129,7 +130,8 @@ class VisitorCreate(VisitorBase):
 class VisitorResponse(VisitorBase):
     """Schema for visitor response"""
     id: int
-    photo_path: str
+    photo_path: Optional[str] = None
+    photo_base64: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
 

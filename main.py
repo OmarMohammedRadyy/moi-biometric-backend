@@ -560,7 +560,8 @@ async def get_scan_logs(
                 full_name=visitor.full_name,
                 passport_number=visitor.passport_number,
                 visa_status=visitor.visa_status,
-                photo_path=visitor.photo_path
+                photo_path=visitor.photo_path,
+                photo_base64=visitor.photo_base64
             )
         
         log_responses.append(ScanLogResponse(
@@ -625,7 +626,8 @@ async def get_dashboard_stats(
                 full_name=visitor.full_name,
                 passport_number=visitor.passport_number,
                 visa_status=visitor.visa_status,
-                photo_path=visitor.photo_path
+                photo_path=visitor.photo_path,
+                photo_base64=visitor.photo_base64
             )
         
         recent_scans.append(ScanLogResponse(
@@ -682,11 +684,18 @@ async def register_visitor(
         if image.mode != "RGB":
             image = image.convert("RGB")
         
-        # Save photo
+        # Resize image to reduce storage size (max 500px width)
+        max_width = 500
+        if image.width > max_width:
+            ratio = max_width / image.width
+            new_height = int(image.height * ratio)
+            image = image.resize((max_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Save photo temporarily for face detection
         file_extension = photo.filename.split(".")[-1] if "." in photo.filename else "jpg"
         unique_filename = f"{uuid.uuid4()}.{file_extension}"
         photo_path = os.path.join(UPLOAD_DIR, unique_filename)
-        image.save(photo_path, quality=95)
+        image.save(photo_path, quality=85)
         
         # Generate face embedding
         try:
@@ -699,12 +708,22 @@ async def register_visitor(
                 detail=str(e)
             )
         
-        # Create visitor record
+        # Convert image to base64 for database storage
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG", quality=85)
+        photo_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        
+        # Clean up temporary file
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
+        
+        # Create visitor record with base64 photo
         visitor = Visitor(
             full_name=full_name,
             passport_number=passport_number,
             visa_status=visa_status,
-            photo_path=unique_filename,
+            photo_path=unique_filename,  # Keep for compatibility
+            photo_base64=photo_base64,   # Store actual photo data
             face_encoding=face_embedding
         )
         
@@ -914,6 +933,7 @@ async def verify_face(
                     passport_number=best_match.passport_number,
                     visa_status=best_match.visa_status,
                     photo_path=best_match.photo_path,
+                    photo_base64=best_match.photo_base64,
                     created_at=best_match.created_at,
                     updated_at=best_match.updated_at
                 ),
