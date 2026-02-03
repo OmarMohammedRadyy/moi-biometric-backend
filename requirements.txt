@@ -11,3 +11,4 @@ deepface>=0.0.90
 tf-keras>=2.15.0
 opencv-python-headless>=4.9.0
 gunicorn>=21.2.0
+pg8000>=1.30.0
