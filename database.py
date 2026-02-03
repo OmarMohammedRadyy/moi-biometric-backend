@@ -45,6 +45,19 @@ def init_db():
                 from models import Visitor
                 Base.metadata.create_all(bind=engine)
                 print("✅ Tables initialized successfully.", flush=True)
+                
+                # Add photo_base64 column if it doesn't exist (migration)
+                try:
+                    from sqlalchemy import text
+                    connection.execute(text("""
+                        ALTER TABLE visitors 
+                        ADD COLUMN IF NOT EXISTS photo_base64 TEXT
+                    """))
+                    connection.commit()
+                    print("✅ photo_base64 column ensured.", flush=True)
+                except Exception as col_err:
+                    print(f"⚠️ Column migration note: {col_err}", flush=True)
+                
                 return
         except Exception as e:
             print(f"⚠️ DB Connection failed: {e}. Retrying in 5s... ({retries} left)", flush=True)
