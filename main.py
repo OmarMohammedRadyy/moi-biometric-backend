@@ -1,36 +1,58 @@
 """
 MOI Biometric System - FastAPI Backend
 Main application file with all API endpoints
-Using DeepFace for face recognition (compatible with Python 3.13)
+Using DeepFace for face recognition
 """
 
 import os
 import uuid
 import base64
 from io import BytesIO
-from typing import List
-import json
+from typing import List, Optional
+from datetime import datetime, timedelta
 
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException, status
+from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException, status, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func, and_
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 # Import DeepFace for face recognition
 from deepface import DeepFace
 
 from database import get_db, init_db, engine, Base
-from models import Visitor
+from models import Visitor, User, AuthLog, ScanLog
 from schemas import (
     VisitorResponse,
     VisitorList,
     VerificationResult,
     MessageResponse,
-    ErrorResponse
+    ErrorResponse,
+    UserCreate,
+    UserResponse,
+    UserList,
+    UserToggleResponse,
+    AuthLogResponse,
+    AuthLogList,
+    ScanLogResponse,
+    ScanLogList,
+    ScanLogVisitor,
+    DashboardStats
+)
+from auth import (
+    authenticate_user,
+    verify_token,
+    revoke_token,
+    hash_password,
+    create_default_admin,
+    is_admin,
+    get_current_user_id,
+    get_current_user_role
 )
 
 # Load environment variables
@@ -38,27 +60,27 @@ load_dotenv()
 
 # Configuration
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+SCAN_PHOTOS_DIR = os.path.join(UPLOAD_DIR, "scans")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(SCAN_PHOTOS_DIR, exist_ok=True)
 
-# DeepFace model to use (options: VGG-Face, Facenet, Facenet512, OpenFace, DeepFace, DeepID, ArcFace, Dlib, SFace)
-FACE_MODEL = "Facenet512"  # Good balance of speed and accuracy
-DISTANCE_METRIC = "cosine"  # cosine, euclidean, euclidean_l2
-MATCH_THRESHOLD = 0.40  # Lower = more strict matching
+# DeepFace model configuration
+FACE_MODEL = "Facenet512"
+DISTANCE_METRIC = "cosine"
+MATCH_THRESHOLD = 0.40
 
 # Initialize FastAPI app
 app = FastAPI(
     title="MOI Biometric System",
     description="Kuwait Ministry of Interior - Facial Recognition Security System",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
 
-# CORS Configuration - Allow frontend to connect
-# Read allowed origins from environment variable (comma-separated)
+# CORS Configuration
 cors_origins_env = os.getenv("CORS_ORIGINS", "")
 cors_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
-# Add default development origins
 cors_origins.extend(["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"])
 
 app.add_middleware(
@@ -69,19 +91,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount uploads directory for serving photos
+# Mount uploads directory
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
 # ==================== Helper Functions ====================
 
 def get_face_embedding(image_path: str) -> list:
-    """
-    Generate face embedding using DeepFace.
-    Returns a list of floats representing the face encoding.
-    """
+    """Generate face embedding using DeepFace."""
     try:
-        # Get embedding using DeepFace
         embedding_objs = DeepFace.represent(
             img_path=image_path,
             model_name=FACE_MODEL,
@@ -95,7 +113,6 @@ def get_face_embedding(image_path: str) -> list:
         if len(embedding_objs) > 1:
             raise ValueError(f"Multiple faces ({len(embedding_objs)}) detected in image")
         
-        # Return the embedding vector
         return embedding_objs[0]["embedding"]
     
     except Exception as e:
@@ -103,61 +120,119 @@ def get_face_embedding(image_path: str) -> list:
 
 
 def compare_embeddings(embedding1: list, embedding2: list) -> float:
-    """
-    Compare two face embeddings and return distance.
-    Lower distance = more similar faces.
-    """
+    """Compare two face embeddings and return distance."""
     vec1 = np.array(embedding1)
     vec2 = np.array(embedding2)
     
     if DISTANCE_METRIC == "cosine":
-        # Cosine distance
         dot_product = np.dot(vec1, vec2)
         norm1 = np.linalg.norm(vec1)
         norm2 = np.linalg.norm(vec2)
         similarity = dot_product / (norm1 * norm2)
         distance = 1 - similarity
     else:
-        # Euclidean distance
         distance = np.linalg.norm(vec1 - vec2)
     
     return float(distance)
+
+
+def get_client_ip(request: Request) -> str:
+    """Get client IP address from request."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def get_token_from_header(authorization: Optional[str] = Header(None)) -> Optional[str]:
+    """Extract token from Authorization header."""
+    if authorization and authorization.startswith("Bearer "):
+        return authorization[7:]
+    return None
+
+
+async def require_auth(
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = None
+) -> dict:
+    """Dependency to require authentication."""
+    # Try header first, then query param
+    auth_token = get_token_from_header(authorization) or token
+    
+    if not auth_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="غير مصرح - يرجى تسجيل الدخول"
+        )
+    
+    user_data = verify_token(auth_token)
+    if not user_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="الجلسة غير صالحة أو منتهية"
+        )
+    
+    return user_data
+
+
+async def require_admin(
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = None
+) -> dict:
+    """Dependency to require admin role."""
+    user_data = await require_auth(authorization, token)
+    
+    if user_data.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="هذا الإجراء يتطلب صلاحيات المدير"
+        )
+    
+    return user_data
 
 
 # ==================== Startup Event ====================
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database tables on startup"""
-    print("🚀 Starting MOI Biometric System...")
+    """Initialize database and default admin on startup."""
+    print("🚀 Starting MOI Biometric System v2.0...")
     try:
         init_db()
         print("✅ Database initialized successfully!")
+        
+        # Create default admin if needed
+        from database import SessionLocal
+        db = SessionLocal()
+        try:
+            create_default_admin(db)
+        finally:
+            db.close()
+            
     except Exception as e:
         print(f"⚠️ Database initialization warning: {e}")
-        print("⚠️ App will continue - database might come up later")
+    
     print(f"🧠 Face Recognition Model: {FACE_MODEL}")
     print(f"📏 Distance Metric: {DISTANCE_METRIC}")
     print(f"🎯 Match Threshold: {MATCH_THRESHOLD}")
-
 
 
 # ==================== Health Check ====================
 
 @app.get("/", tags=["Health"])
 async def root():
-    """Health check endpoint"""
+    """Health check endpoint."""
     return {
         "status": "online",
         "system": "MOI Biometric Security System",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "face_model": FACE_MODEL
     }
 
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Detailed health check"""
+    """Detailed health check."""
     return {
         "status": "healthy",
         "database": "connected",
@@ -169,53 +244,86 @@ async def health_check():
 
 # ==================== Authentication ====================
 
-from auth import authenticate_user, verify_token, revoke_token
-from pydantic import BaseModel
-
 class LoginRequest(BaseModel):
     username: str
     password: str
 
 class TokenResponse(BaseModel):
     token: str
+    user_id: int
     username: str
+    full_name: str
+    role: str
     message: str
 
 
 @app.post("/api/auth/login", response_model=TokenResponse, tags=["Authentication"])
-async def login(request: LoginRequest):
-    """
-    Login with username and password.
-    Returns a token for authenticated requests.
-    """
-    token = authenticate_user(request.username, request.password)
+async def login(
+    request: LoginRequest,
+    req: Request,
+    db: Session = Depends(get_db)
+):
+    """Login with username and password."""
+    result = authenticate_user(request.username, request.password, db)
     
-    if not token:
+    if not result:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="اسم المستخدم أو كلمة المرور غير صحيحة"
+            detail="اسم المستخدم أو كلمة المرور غير صحيحة أو الحساب معطل"
         )
     
-    return {
-        "token": token,
-        "username": request.username,
-        "message": "تم تسجيل الدخول بنجاح"
-    }
+    # Log the login
+    auth_log = AuthLog(
+        user_id=result["user_id"],
+        action="login",
+        ip_address=get_client_ip(req),
+        user_agent=req.headers.get("User-Agent", "")[:500],
+        location=None  # Can be enhanced with GeoIP
+    )
+    db.add(auth_log)
+    db.commit()
+    
+    return TokenResponse(
+        token=result["token"],
+        user_id=result["user_id"],
+        username=result["username"],
+        full_name=result["full_name"],
+        role=result["role"],
+        message="تم تسجيل الدخول بنجاح"
+    )
 
 
 @app.post("/api/auth/logout", tags=["Authentication"])
-async def logout(token: str = Form(...)):
-    """Logout and invalidate token"""
+async def logout(
+    req: Request,
+    token: str = Form(...),
+    db: Session = Depends(get_db)
+):
+    """Logout and invalidate token."""
+    user_data = verify_token(token)
+    
+    if user_data:
+        # Log the logout
+        auth_log = AuthLog(
+            user_id=user_data["user_id"],
+            action="logout",
+            ip_address=get_client_ip(req),
+            user_agent=req.headers.get("User-Agent", "")[:500],
+            location=None
+        )
+        db.add(auth_log)
+        db.commit()
+    
     revoke_token(token)
     return {"message": "تم تسجيل الخروج بنجاح"}
 
 
 @app.get("/api/auth/verify", tags=["Authentication"])
 async def verify_auth(token: str):
-    """Verify if a token is valid"""
-    username = verify_token(token)
+    """Verify if a token is valid."""
+    user_data = verify_token(token)
     
-    if not username:
+    if not user_data:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="الجلسة غير صالحة أو منتهية"
@@ -223,74 +331,367 @@ async def verify_auth(token: str):
     
     return {
         "valid": True,
-        "username": username
+        "user_id": user_data["user_id"],
+        "username": user_data["username"],
+        "full_name": user_data["full_name"],
+        "role": user_data["role"]
     }
 
 
 @app.get("/api/auth/me", tags=["Authentication"])
-async def get_current_user(token: str):
-    """Get current authenticated user info"""
-    username = verify_token(token)
-    
-    if not username:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="غير مصرح"
-        )
-    
+async def get_current_user(user_data: dict = Depends(require_auth)):
+    """Get current authenticated user info."""
     return {
-        "username": username,
-        "role": "admin"
+        "user_id": user_data["user_id"],
+        "username": user_data["username"],
+        "full_name": user_data["full_name"],
+        "role": user_data["role"]
     }
 
 
-# ==================== Visitor Management (Admin) ====================
+# ==================== User Management (Admin Only) ====================
 
-@app.post("/api/visitors", response_model=VisitorResponse, tags=["Admin"])
+@app.post("/api/users", response_model=UserResponse, tags=["User Management"])
+async def create_user(
+    user_data: UserCreate,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Create a new user (admin only)."""
+    # Check if username exists
+    existing = db.query(User).filter(User.username == user_data.username).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"اسم المستخدم '{user_data.username}' مستخدم بالفعل"
+        )
+    
+    # Create user
+    new_user = User(
+        username=user_data.username,
+        password_hash=hash_password(user_data.password),
+        full_name=user_data.full_name,
+        role=user_data.role if user_data.role in ["admin", "officer"] else "officer",
+        is_active=True,
+        created_by=admin["user_id"]
+    )
+    
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    print(f"✅ New user created: {new_user.username} ({new_user.role}) by {admin['username']}")
+    
+    return new_user
+
+
+@app.get("/api/users", response_model=UserList, tags=["User Management"])
+async def list_users(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get all users (admin only)."""
+    users = db.query(User).order_by(User.created_at.desc()).all()
+    return UserList(users=users, total=len(users))
+
+
+@app.get("/api/users/{user_id}", response_model=UserResponse, tags=["User Management"])
+async def get_user(
+    user_id: int,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get a specific user by ID (admin only)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"المستخدم غير موجود"
+        )
+    return user
+
+
+@app.patch("/api/users/{user_id}/toggle", response_model=UserToggleResponse, tags=["User Management"])
+async def toggle_user_status(
+    user_id: int,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Toggle user active status (admin only)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="المستخدم غير موجود"
+        )
+    
+    # Prevent admin from disabling themselves
+    if user.id == admin["user_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="لا يمكنك تعطيل حسابك الخاص"
+        )
+    
+    user.is_active = not user.is_active
+    db.commit()
+    
+    status_text = "مفعّل" if user.is_active else "معطّل"
+    print(f"👤 User {user.username} is now {status_text} by {admin['username']}")
+    
+    return UserToggleResponse(
+        success=True,
+        user_id=user.id,
+        is_active=user.is_active,
+        message=f"تم {'تفعيل' if user.is_active else 'تعطيل'} حساب {user.full_name}"
+    )
+
+
+@app.delete("/api/users/{user_id}", response_model=MessageResponse, tags=["User Management"])
+async def delete_user(
+    user_id: int,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Delete a user (admin only)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="المستخدم غير موجود"
+        )
+    
+    # Prevent admin from deleting themselves
+    if user.id == admin["user_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="لا يمكنك حذف حسابك الخاص"
+        )
+    
+    username = user.username
+    db.delete(user)
+    db.commit()
+    
+    return MessageResponse(success=True, message=f"تم حذف المستخدم {username}")
+
+
+# ==================== Auth Logs (Admin Only) ====================
+
+@app.get("/api/logs/auth", response_model=AuthLogList, tags=["Logs"])
+async def get_auth_logs(
+    page: int = 1,
+    per_page: int = 50,
+    user_id: Optional[int] = None,
+    action: Optional[str] = None,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get authentication logs with pagination (admin only)."""
+    query = db.query(AuthLog).join(User)
+    
+    # Apply filters
+    if user_id:
+        query = query.filter(AuthLog.user_id == user_id)
+    if action:
+        query = query.filter(AuthLog.action == action)
+    
+    # Get total count
+    total = query.count()
+    
+    # Apply pagination
+    offset = (page - 1) * per_page
+    logs = query.order_by(AuthLog.timestamp.desc()).offset(offset).limit(per_page).all()
+    
+    # Build response
+    log_responses = []
+    for log in logs:
+        user = db.query(User).filter(User.id == log.user_id).first()
+        log_responses.append(AuthLogResponse(
+            id=log.id,
+            user_id=log.user_id,
+            username=user.username if user else "unknown",
+            full_name=user.full_name if user else "unknown",
+            action=log.action,
+            timestamp=log.timestamp,
+            ip_address=log.ip_address,
+            user_agent=log.user_agent,
+            location=log.location
+        ))
+    
+    return AuthLogList(logs=log_responses, total=total, page=page, per_page=per_page)
+
+
+# ==================== Scan Logs (Admin Only) ====================
+
+@app.get("/api/logs/scans", response_model=ScanLogList, tags=["Logs"])
+async def get_scan_logs(
+    page: int = 1,
+    per_page: int = 50,
+    officer_id: Optional[int] = None,
+    match_only: bool = True,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get scan logs with pagination (admin only). By default shows only matches."""
+    query = db.query(ScanLog).join(User, ScanLog.officer_id == User.id)
+    
+    # Apply filters
+    if officer_id:
+        query = query.filter(ScanLog.officer_id == officer_id)
+    if match_only:
+        query = query.filter(ScanLog.match_found == True)
+    
+    # Get total count
+    total = query.count()
+    
+    # Apply pagination
+    offset = (page - 1) * per_page
+    logs = query.order_by(ScanLog.timestamp.desc()).offset(offset).limit(per_page).all()
+    
+    # Build response
+    log_responses = []
+    for log in logs:
+        officer = db.query(User).filter(User.id == log.officer_id).first()
+        visitor = db.query(Visitor).filter(Visitor.id == log.visitor_id).first() if log.visitor_id else None
+        
+        visitor_data = None
+        if visitor:
+            visitor_data = ScanLogVisitor(
+                id=visitor.id,
+                full_name=visitor.full_name,
+                passport_number=visitor.passport_number,
+                visa_status=visitor.visa_status,
+                photo_path=visitor.photo_path
+            )
+        
+        log_responses.append(ScanLogResponse(
+            id=log.id,
+            officer_id=log.officer_id,
+            officer_name=officer.full_name if officer else "unknown",
+            officer_username=officer.username if officer else "unknown",
+            visitor=visitor_data,
+            match_found=log.match_found,
+            confidence=log.confidence,
+            timestamp=log.timestamp,
+            ip_address=log.ip_address,
+            location=log.location,
+            captured_photo_path=log.captured_photo_path
+        ))
+    
+    return ScanLogList(logs=log_responses, total=total, page=page, per_page=per_page)
+
+
+# ==================== Dashboard Statistics (Admin Only) ====================
+
+@app.get("/api/dashboard/stats", response_model=DashboardStats, tags=["Dashboard"])
+async def get_dashboard_stats(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get dashboard statistics (admin only)."""
+    now = datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timedelta(days=7)
+    
+    # Counts
+    total_visitors = db.query(Visitor).count()
+    total_officers = db.query(User).filter(User.role == "officer").count()
+    
+    # Today's scans
+    total_scans_today = db.query(ScanLog).filter(ScanLog.timestamp >= today_start).count()
+    total_matches_today = db.query(ScanLog).filter(
+        and_(ScanLog.timestamp >= today_start, ScanLog.match_found == True)
+    ).count()
+    
+    # Week's scans
+    total_scans_week = db.query(ScanLog).filter(ScanLog.timestamp >= week_start).count()
+    total_matches_week = db.query(ScanLog).filter(
+        and_(ScanLog.timestamp >= week_start, ScanLog.match_found == True)
+    ).count()
+    
+    # Recent scans (last 10 matches)
+    recent_logs = db.query(ScanLog).filter(ScanLog.match_found == True).order_by(
+        ScanLog.timestamp.desc()
+    ).limit(10).all()
+    
+    recent_scans = []
+    for log in recent_logs:
+        officer = db.query(User).filter(User.id == log.officer_id).first()
+        visitor = db.query(Visitor).filter(Visitor.id == log.visitor_id).first() if log.visitor_id else None
+        
+        visitor_data = None
+        if visitor:
+            visitor_data = ScanLogVisitor(
+                id=visitor.id,
+                full_name=visitor.full_name,
+                passport_number=visitor.passport_number,
+                visa_status=visitor.visa_status,
+                photo_path=visitor.photo_path
+            )
+        
+        recent_scans.append(ScanLogResponse(
+            id=log.id,
+            officer_id=log.officer_id,
+            officer_name=officer.full_name if officer else "unknown",
+            officer_username=officer.username if officer else "unknown",
+            visitor=visitor_data,
+            match_found=log.match_found,
+            confidence=log.confidence,
+            timestamp=log.timestamp,
+            ip_address=log.ip_address,
+            location=log.location,
+            captured_photo_path=log.captured_photo_path
+        ))
+    
+    return DashboardStats(
+        total_visitors=total_visitors,
+        total_officers=total_officers,
+        total_scans_today=total_scans_today,
+        total_matches_today=total_matches_today,
+        total_scans_week=total_scans_week,
+        total_matches_week=total_matches_week,
+        recent_scans=recent_scans,
+        system_status="operational"
+    )
+
+
+# ==================== Visitor Management (Admin Only) ====================
+
+@app.post("/api/visitors", response_model=VisitorResponse, tags=["Visitors"])
 async def register_visitor(
     full_name: str = Form(...),
     passport_number: str = Form(...),
     visa_status: str = Form(...),
     photo: UploadFile = File(...),
+    admin: dict = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """
-    Register a new visitor with their photo.
-    
-    - Detects face in the uploaded photo
-    - Generates face embedding using DeepFace
-    - Stores visitor data and embedding in database
-    """
+    """Register a new visitor with their photo (admin only)."""
     try:
         # Check if passport already exists
         existing = db.query(Visitor).filter(Visitor.passport_number == passport_number).first()
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Visitor with passport {passport_number} already registered"
+                detail=f"الزائر برقم جواز {passport_number} مسجل مسبقاً"
             )
 
         # Read and validate image
         contents = await photo.read()
         image = Image.open(BytesIO(contents))
         
-        # Convert to RGB if necessary
         if image.mode != "RGB":
             image = image.convert("RGB")
         
-        # Save photo temporarily for processing
+        # Save photo
         file_extension = photo.filename.split(".")[-1] if "." in photo.filename else "jpg"
         unique_filename = f"{uuid.uuid4()}.{file_extension}"
         photo_path = os.path.join(UPLOAD_DIR, unique_filename)
-        
-        # Save the image
         image.save(photo_path, quality=95)
         
         # Generate face embedding
         try:
             face_embedding = get_face_embedding(photo_path)
         except ValueError as e:
-            # Delete the saved photo if face detection fails
             if os.path.exists(photo_path):
                 os.remove(photo_path)
             raise HTTPException(
@@ -311,7 +712,7 @@ async def register_visitor(
         db.commit()
         db.refresh(visitor)
         
-        print(f"✅ Visitor registered: {full_name} ({passport_number})")
+        print(f"✅ Visitor registered: {full_name} ({passport_number}) by {admin['username']}")
         
         return visitor
 
@@ -321,73 +722,99 @@ async def register_visitor(
         print(f"❌ Error registering visitor: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing registration: {str(e)}"
+            detail=f"خطأ في تسجيل الزائر: {str(e)}"
         )
 
 
-@app.get("/api/visitors", response_model=VisitorList, tags=["Admin"])
-async def list_visitors(db: Session = Depends(get_db)):
-    """Get all registered visitors"""
+@app.get("/api/visitors", response_model=VisitorList, tags=["Visitors"])
+async def list_visitors(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get all registered visitors (admin only)."""
     visitors = db.query(Visitor).order_by(Visitor.created_at.desc()).all()
     return VisitorList(visitors=visitors, total=len(visitors))
 
 
-@app.get("/api/visitors/{visitor_id}", response_model=VisitorResponse, tags=["Admin"])
-async def get_visitor(visitor_id: int, db: Session = Depends(get_db)):
-    """Get a specific visitor by ID"""
+@app.get("/api/visitors/{visitor_id}", response_model=VisitorResponse, tags=["Visitors"])
+async def get_visitor(
+    visitor_id: int,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get a specific visitor by ID (admin only)."""
     visitor = db.query(Visitor).filter(Visitor.id == visitor_id).first()
     if not visitor:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Visitor with ID {visitor_id} not found"
+            detail="الزائر غير موجود"
         )
     return visitor
 
 
-@app.delete("/api/visitors/{visitor_id}", response_model=MessageResponse, tags=["Admin"])
-async def delete_visitor(visitor_id: int, db: Session = Depends(get_db)):
-    """Delete a visitor by ID"""
+@app.delete("/api/visitors/{visitor_id}", response_model=MessageResponse, tags=["Visitors"])
+async def delete_visitor(
+    visitor_id: int,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Delete a visitor by ID (admin only)."""
     visitor = db.query(Visitor).filter(Visitor.id == visitor_id).first()
     if not visitor:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Visitor with ID {visitor_id} not found"
+            detail="الزائر غير موجود"
         )
     
-    # Delete photo file if exists
+    # Delete photo file
     photo_path = os.path.join(UPLOAD_DIR, visitor.photo_path)
     if os.path.exists(photo_path):
         os.remove(photo_path)
     
+    name = visitor.full_name
     db.delete(visitor)
     db.commit()
     
-    return MessageResponse(success=True, message=f"Visitor {visitor.full_name} deleted successfully")
+    return MessageResponse(success=True, message=f"تم حذف الزائر {name}")
 
 
-# ==================== Face Verification (Security Scanner) ====================
+# ==================== Face Verification (All Authenticated Users) ====================
 
 @app.post("/api/verify", response_model=VerificationResult, tags=["Security"])
 async def verify_face(
+    req: Request,
     photo: UploadFile = File(...),
+    token: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ):
     """
     Verify a face against all registered visitors.
-    
-    - Accepts an image upload from the security scanner
-    - Detects face and generates embedding
-    - Compares against all stored embeddings in database
-    - Returns match result with visitor details if found
+    Logs the scan with officer information.
     """
+    # Get authenticated user
+    auth_token = get_token_from_header(authorization) or token
+    if not auth_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="غير مصرح - يرجى تسجيل الدخول"
+        )
+    
+    user_data = verify_token(auth_token)
+    if not user_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="الجلسة غير صالحة أو منتهية"
+        )
+    
     temp_path = None
+    saved_scan_path = None
     
     try:
         # Read and process uploaded image
         contents = await photo.read()
         image = Image.open(BytesIO(contents))
         
-        # Convert to RGB if necessary
         if image.mode != "RGB":
             image = image.convert("RGB")
         
@@ -395,10 +822,23 @@ async def verify_face(
         temp_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4()}.jpg")
         image.save(temp_path, quality=95)
         
-        # Generate face embedding for captured image
+        # Generate face embedding
         try:
             captured_embedding = get_face_embedding(temp_path)
         except ValueError as e:
+            # Log failed scan (no face detected)
+            scan_log = ScanLog(
+                officer_id=user_data["user_id"],
+                visitor_id=None,
+                match_found=False,
+                confidence=None,
+                ip_address=get_client_ip(req),
+                location=None,
+                captured_photo_path=None
+            )
+            db.add(scan_log)
+            db.commit()
+            
             return VerificationResult(
                 match_found=False,
                 confidence=None,
@@ -407,7 +847,7 @@ async def verify_face(
                 captured_photo=None
             )
         
-        # Get all visitors from database
+        # Get all visitors
         visitors = db.query(Visitor).all()
         
         if len(visitors) == 0:
@@ -415,7 +855,7 @@ async def verify_face(
                 match_found=False,
                 confidence=None,
                 visitor=None,
-                message="No registered visitors in database",
+                message="لا يوجد زوار مسجلين في قاعدة البيانات",
                 captured_photo=None
             )
         
@@ -431,17 +871,39 @@ async def verify_face(
                 best_distance = distance
                 best_match = visitor
         
-        # Convert captured image to base64 for frontend display
+        # Convert captured image to base64
         buffered = BytesIO()
         image.save(buffered, format="JPEG", quality=85)
         captured_base64 = base64.b64encode(buffered.getvalue()).decode()
         
-        # Check if best match is within threshold
-        if best_match and best_distance < MATCH_THRESHOLD:
-            # Convert distance to confidence percentage (inverse relationship)
-            confidence = round((1 - best_distance) * 100, 2)
-            
-            print(f"✅ MATCH FOUND: {best_match.full_name} (Distance: {best_distance:.4f}, Confidence: {confidence}%)")
+        # Check if match found
+        match_found = best_match and best_distance < MATCH_THRESHOLD
+        confidence = round((1 - best_distance) * 100, 2) if best_distance < 1 else 0
+        
+        # Save scan photo only for matches
+        if match_found:
+            scan_filename = f"scan_{uuid.uuid4()}.jpg"
+            saved_scan_path = os.path.join(SCAN_PHOTOS_DIR, scan_filename)
+            image.save(saved_scan_path, quality=85)
+            relative_scan_path = f"scans/{scan_filename}"
+        else:
+            relative_scan_path = None
+        
+        # Log the scan
+        scan_log = ScanLog(
+            officer_id=user_data["user_id"],
+            visitor_id=best_match.id if match_found else None,
+            match_found=match_found,
+            confidence=confidence,
+            ip_address=get_client_ip(req),
+            location=None,
+            captured_photo_path=relative_scan_path
+        )
+        db.add(scan_log)
+        db.commit()
+        
+        if match_found:
+            print(f"✅ MATCH: {best_match.full_name} by {user_data['username']} (Confidence: {confidence}%)")
             
             return VerificationResult(
                 match_found=True,
@@ -455,17 +917,17 @@ async def verify_face(
                     created_at=best_match.created_at,
                     updated_at=best_match.updated_at
                 ),
-                message=f"Identity Verified: {best_match.full_name}",
+                message=f"تم التحقق من الهوية: {best_match.full_name}",
                 captured_photo=captured_base64
             )
         else:
-            print(f"❌ NO MATCH: Best distance was {best_distance:.4f} (threshold: {MATCH_THRESHOLD})")
+            print(f"❌ NO MATCH by {user_data['username']} (Best distance: {best_distance:.4f})")
             
             return VerificationResult(
                 match_found=False,
-                confidence=round((1 - best_distance) * 100, 2) if best_distance < 1 else 0,
+                confidence=confidence,
                 visitor=None,
-                message="NOT AUTHORIZED - No matching record found",
+                message="غير مصرح - لا يوجد تطابق في السجلات",
                 captured_photo=captured_base64
             )
 
@@ -473,11 +935,11 @@ async def verify_face(
         print(f"❌ Verification error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during verification: {str(e)}"
+            detail=f"خطأ في التحقق: {str(e)}"
         )
     
     finally:
-        # Clean up temporary file
+        # Clean up temp file
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -487,13 +949,22 @@ async def verify_face(
 
 # ==================== Statistics ====================
 
-@app.get("/api/stats", tags=["Admin"])
-async def get_statistics(db: Session = Depends(get_db)):
-    """Get system statistics"""
+@app.get("/api/stats", tags=["Statistics"])
+async def get_statistics(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get system statistics (admin only)."""
     total_visitors = db.query(Visitor).count()
+    total_users = db.query(User).count()
+    total_scans = db.query(ScanLog).count()
+    total_matches = db.query(ScanLog).filter(ScanLog.match_found == True).count()
     
     return {
         "total_visitors": total_visitors,
+        "total_users": total_users,
+        "total_scans": total_scans,
+        "total_matches": total_matches,
         "system_status": "operational",
         "face_recognition_model": FACE_MODEL,
         "distance_metric": DISTANCE_METRIC,
@@ -510,8 +981,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     
     print(f"🔒 Starting on http://{host}:{port}", flush=True)
-    
-    # Run directly - no reload in production
     uvicorn.run(app, host=host, port=port)
-
-

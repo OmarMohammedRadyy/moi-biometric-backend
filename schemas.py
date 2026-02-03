@@ -7,6 +7,111 @@ from typing import Optional, List
 from datetime import datetime
 
 
+# ==================== User Schemas ====================
+
+class UserBase(BaseModel):
+    """Base schema for user data"""
+    username: str = Field(..., min_length=3, max_length=100, description="Unique username")
+    full_name: str = Field(..., min_length=2, max_length=255, description="User's full name")
+    role: str = Field(default="officer", description="User role: admin or officer")
+
+
+class UserCreate(UserBase):
+    """Schema for creating a new user"""
+    password: str = Field(..., min_length=4, max_length=100, description="User password")
+
+
+class UserResponse(UserBase):
+    """Schema for user response"""
+    id: int
+    is_active: bool
+    created_at: datetime
+    created_by: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserList(BaseModel):
+    """Schema for list of users"""
+    users: List[UserResponse]
+    total: int
+
+
+class UserToggleResponse(BaseModel):
+    """Schema for toggle user active status response"""
+    success: bool
+    user_id: int
+    is_active: bool
+    message: str
+
+
+# ==================== Auth Log Schemas ====================
+
+class AuthLogResponse(BaseModel):
+    """Schema for auth log response"""
+    id: int
+    user_id: int
+    username: str
+    full_name: str
+    action: str  # "login" or "logout"
+    timestamp: datetime
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    location: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AuthLogList(BaseModel):
+    """Schema for list of auth logs"""
+    logs: List[AuthLogResponse]
+    total: int
+    page: int
+    per_page: int
+
+
+# ==================== Scan Log Schemas ====================
+
+class ScanLogVisitor(BaseModel):
+    """Minimal visitor info for scan log"""
+    id: int
+    full_name: str
+    passport_number: str
+    visa_status: str
+    photo_path: str
+
+    class Config:
+        from_attributes = True
+
+
+class ScanLogResponse(BaseModel):
+    """Schema for scan log response"""
+    id: int
+    officer_id: int
+    officer_name: str
+    officer_username: str
+    visitor: Optional[ScanLogVisitor] = None
+    match_found: bool
+    confidence: Optional[float] = None
+    timestamp: datetime
+    ip_address: Optional[str] = None
+    location: Optional[str] = None
+    captured_photo_path: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ScanLogList(BaseModel):
+    """Schema for list of scan logs"""
+    logs: List[ScanLogResponse]
+    total: int
+    page: int
+    per_page: int
+
+
 # ==================== Visitor Schemas ====================
 
 class VisitorBase(BaseModel):
@@ -69,3 +174,17 @@ class ErrorResponse(BaseModel):
     success: bool = False
     error: str
     detail: Optional[str] = None
+
+
+# ==================== Dashboard Statistics ====================
+
+class DashboardStats(BaseModel):
+    """Schema for admin dashboard statistics"""
+    total_visitors: int
+    total_officers: int
+    total_scans_today: int
+    total_matches_today: int
+    total_scans_week: int
+    total_matches_week: int
+    recent_scans: List[ScanLogResponse]
+    system_status: str
