@@ -33,7 +33,7 @@ def get_db():
 def init_db():
     """Wait for DB and Create Tables"""
     print("⏳ Waiting for Database...", flush=True)
-    retries = 5
+    retries = 10
     while retries > 0:
         try:
             # Try to connect
@@ -43,14 +43,16 @@ def init_db():
                 from models import Visitor
                 Base.metadata.create_all(bind=engine)
                 print("✅ Tables initialized successfully.", flush=True)
-                break
+                return
         except Exception as e:
-            print(f"⚠️ DB Connection failed: {e}. Retrying in 3s...", flush=True)
+            print(f"⚠️ DB Connection failed: {e}. Retrying in 5s... ({retries} left)", flush=True)
             retries -= 1
-            time.sleep(3)
+            time.sleep(5)
     
-    if retries == 0:
-        print("❌ Could not connect to Database after retries.", flush=True)
+    print("❌ Could not connect to Database after retries.", flush=True)
+    # Don't exit, let FastAPI try to run anyway, maybe DB comes up late
+
+    
 
 def get_db_info():
     return {"type": "PostgreSQL", "status": "Connected"}
