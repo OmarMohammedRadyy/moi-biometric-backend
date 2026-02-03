@@ -45,19 +45,6 @@ def init_db():
                 from models import Visitor
                 Base.metadata.create_all(bind=engine)
                 print("✅ Tables initialized successfully.", flush=True)
-                
-                # Add photo_base64 column if it doesn't exist (migration)
-                try:
-                    from sqlalchemy import text
-                    connection.execute(text("""
-                        ALTER TABLE visitors 
-                        ADD COLUMN IF NOT EXISTS photo_base64 TEXT
-                    """))
-                    connection.commit()
-                    print("✅ photo_base64 column ensured.", flush=True)
-                except Exception as col_err:
-                    print(f"⚠️ Column migration note: {col_err}", flush=True)
-                
                 return
         except Exception as e:
             print(f"⚠️ DB Connection failed: {e}. Retrying in 5s... ({retries} left)", flush=True)
@@ -65,7 +52,28 @@ def init_db():
             time.sleep(5)
     
     print("❌ Could not connect to Database after retries.", flush=True)
-    # Don't exit, let FastAPI try to run anyway, maybe DB comes up late
+
+
+def run_migrations():
+    """Run database migrations for new columns"""
+    try:
+        from sqlalchemy import text
+        with engine.begin() as connection:
+            # Add photo_base64 column if it doesn't exist
+            connection.execute(text("""
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='visitors' AND column_name='photo_base64'
+                    ) THEN 
+                        ALTER TABLE visitors ADD COLUMN photo_base64 TEXT;
+                    END IF;
+                END $$;
+            """))
+        print("✅ Migrations completed.", flush=True)
+    except Exception as e:
+        print(f"⚠️ Migration note: {e}", flush=True)
 
     
 
