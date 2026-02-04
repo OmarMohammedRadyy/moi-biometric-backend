@@ -73,27 +73,18 @@ MATCH_THRESHOLD = 0.40
 app = FastAPI(
     title="MOI Biometric System",
     description="Kuwait Ministry of Interior - Facial Recognition Security System",
-    version="2.0.0",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
 
-# CORS Configuration
-ALLOWED_ORIGINS = [
-    "https://moi-biometric-frontend.vercel.app",
-    "https://moi-biometric-frontend-git-main-omars-projects-5731842e.vercel.app",
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://localhost:3000",
-]
-
+# CORS Middleware - Must be added before any routes
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Must be False when using "*"
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
 # Mount uploads directory
