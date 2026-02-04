@@ -604,14 +604,14 @@ async def create_user(
         full_name=user_data.full_name,
         role=user_data.role if user_data.role in ["admin", "officer"] else "officer",
         is_active=True,
-        created_by=admin["user_id"]
+        created_by=user["user_id"]
     )
     
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     
-    print(f"✅ New user created: {new_user.username} ({new_user.role}) by {admin['username']}")
+    print(f"✅ New user created: {new_user.username} ({new_user.role}) by {user['username']}")
     
     return new_user
 
@@ -667,15 +667,15 @@ async def toggle_user_status(
     db.commit()
     
     status_text = "مفعّل" if user.is_active else "معطّل"
-    print(f"👤 User {user.username} is now {status_text} by {admin['username']}")
+    print(f"👤 User {user.username} is now {status_text} by {current_user['username']}")
     
     # Create notification for account status change
     notification = Notification(
         type="account_disabled" if not user.is_active else "account_enabled",
         title=f"تم {'تعطيل' if not user.is_active else 'تفعيل'} حساب",
-        message=f"تم {'تعطيل' if not user.is_active else 'تفعيل'} حساب العسكري {user.full_name} (@{user.username}) بواسطة {admin['full_name']}",
+        message=f"تم {'تعطيل' if not user.is_active else 'تفعيل'} حساب العسكري {user.full_name} (@{user.username}) بواسطة {current_user['full_name']}",
         user_id=user.id,
-        extra_data={"admin_id": admin["user_id"], "admin_username": admin["username"]}
+        extra_data={"admin_id": current_user["user_id"], "admin_username": current_user["username"]}
     )
     db.add(notification)
     db.commit()
@@ -732,8 +732,8 @@ async def update_user(
         user.password_hash = hash_password(user_data.password)
     
     if user_data.role and user_data.role in ["admin", "officer"]:
-        # Prevent admin from changing their own role
-        if user.id == admin["user_id"] and user_data.role != "admin":
+        # Prevent user from changing their own role
+        if user.id == current_user["user_id"] and user_data.role != user.role:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="لا يمكنك تغيير صلاحياتك الخاصة"
@@ -756,7 +756,7 @@ async def update_user(
 @app.delete("/api/users/{user_id}", response_model=MessageResponse, tags=["User Management"])
 async def delete_user(
     user_id: int,
-    user: dict = Depends(require_permission("users")),
+    current_user: dict = Depends(require_permission("users")),
     db: Session = Depends(get_db)
 ):
     """Delete a user."""
@@ -767,8 +767,8 @@ async def delete_user(
             detail="المستخدم غير موجود"
         )
     
-    # Prevent admin from deleting themselves
-    if user.id == admin["user_id"]:
+    # Prevent user from deleting themselves
+    if user.id == current_user["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="لا يمكنك حذف حسابك الخاص"
@@ -1517,7 +1517,7 @@ async def register_visitor(
         # Update embeddings cache
         embeddings_cache.set(visitor.id, face_embedding)
         
-        print(f"✅ Visitor registered: {full_name} ({passport_number}) by {admin['username']}")
+        print(f"✅ Visitor registered: {full_name} ({passport_number}) by {user['username']}")
         
         return visitor
 
