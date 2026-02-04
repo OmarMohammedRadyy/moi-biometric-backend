@@ -1,4 +1,5 @@
 # استخدم Python 3.11 (أفضل توافق مع DeepFace)
+# Build version: 3.5.2 - Force rebuild
 FROM python:3.11-slim-bookworm
 
 # تثبيت المتطلبات للنظام

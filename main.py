@@ -74,7 +74,7 @@ MATCH_THRESHOLD = 0.40
 app = FastAPI(
     title="MOI Biometric System",
     description="Kuwait Ministry of Interior - Facial Recognition Security System",
-    version="3.5.0",
+    version="3.5.2",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -236,7 +236,7 @@ async def root():
     return {
         "status": "online",
         "system": "MOI Biometric Security System",
-        "version": "2.0.0",
+        "version": "3.5.2",
         "face_model": FACE_MODEL
     }
 
