@@ -1212,13 +1212,9 @@ async def register_visitor(
         photo_path = os.path.join(UPLOAD_DIR, unique_filename)
         image.save(photo_path, quality=85)
         
-        # Generate face embedding with quality check
+        # Generate face embedding (fast mode)
         try:
-            face_embedding, quality_result = get_face_embedding(photo_path, with_quality_check=True)
-            
-            # Warn if there are quality issues
-            if quality_result.warnings:
-                print(f"⚠️ Quality warnings for {full_name}: {quality_result.warnings}")
+            face_embedding, _ = get_face_embedding(photo_path, with_quality_check=False)
         except ValueError as e:
             if os.path.exists(photo_path):
                 os.remove(photo_path)
