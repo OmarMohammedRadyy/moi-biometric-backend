@@ -17,7 +17,9 @@ from PIL import Image
 from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException, status, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+import csv
+from io import StringIO
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 from dotenv import load_dotenv
@@ -27,7 +29,7 @@ from pydantic import BaseModel
 from deepface import DeepFace
 
 from database import get_db, init_db, engine, Base
-from models import Visitor, User, AuthLog, ScanLog
+from models import Visitor, User, AuthLog, ScanLog, Notification
 from schemas import (
     VisitorResponse,
     VisitorList,
@@ -43,7 +45,11 @@ from schemas import (
     ScanLogResponse,
     ScanLogList,
     ScanLogVisitor,
-    DashboardStats
+    DashboardStats,
+    TopOfficer,
+    NotificationResponse,
+    NotificationList,
+    ExportRequest
 )
 from auth import (
     authenticate_user,
@@ -74,7 +80,7 @@ MATCH_THRESHOLD = 0.40
 app = FastAPI(
     title="MOI Biometric System",
     description="Kuwait Ministry of Interior - Facial Recognition Security System",
-    version="3.7.1",
+    version="4.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -256,7 +262,7 @@ async def root():
     return {
         "status": "online",
         "system": "MOI Biometric Security System",
-        "version": "3.7.1",
+        "version": "4.0.0",
         "face_model": FACE_MODEL
     }
 
@@ -295,12 +301,34 @@ async def login(
     db: Session = Depends(get_db)
 ):
     """Login with username and password."""
+    # Check if user exists and is disabled
+    user = db.query(User).filter(User.username == request.username).first()
+    if user and not user.is_active:
+        # Create notification for failed login attempt from disabled account
+        notification = Notification(
+            type="failed_login_disabled",
+            title="محاولة دخول من حساب معطل",
+            message=f"محاولة تسجيل دخول فاشلة من الحساب المعطل: {user.full_name} (@{user.username})",
+            user_id=user.id,
+            metadata={
+                "ip_address": get_client_ip(req),
+                "user_agent": req.headers.get("User-Agent", "")[:200]
+            }
+        )
+        db.add(notification)
+        db.commit()
+        
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="الحساب معطل - تواصل مع المدير"
+        )
+    
     result = authenticate_user(request.username, request.password, db)
     
     if not result:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="اسم المستخدم أو كلمة المرور غير صحيحة أو الحساب معطل"
+            detail="اسم المستخدم أو كلمة المرور غير صحيحة"
         )
     
     # Log the login
@@ -469,6 +497,17 @@ async def toggle_user_status(
     status_text = "مفعّل" if user.is_active else "معطّل"
     print(f"👤 User {user.username} is now {status_text} by {admin['username']}")
     
+    # Create notification for account status change
+    notification = Notification(
+        type="account_disabled" if not user.is_active else "account_enabled",
+        title=f"تم {'تعطيل' if not user.is_active else 'تفعيل'} حساب",
+        message=f"تم {'تعطيل' if not user.is_active else 'تفعيل'} حساب العسكري {user.full_name} (@{user.username}) بواسطة {admin['full_name']}",
+        user_id=user.id,
+        metadata={"admin_id": admin["user_id"], "admin_username": admin["username"]}
+    )
+    db.add(notification)
+    db.commit()
+    
     return UserToggleResponse(
         success=True,
         user_id=user.id,
@@ -513,10 +552,12 @@ async def get_auth_logs(
     per_page: int = 50,
     user_id: Optional[int] = None,
     action: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """Get authentication logs with pagination (admin only)."""
+    """Get authentication logs with pagination and advanced filters (admin only)."""
     query = db.query(AuthLog).join(User)
     
     # Apply filters
@@ -524,6 +565,20 @@ async def get_auth_logs(
         query = query.filter(AuthLog.user_id == user_id)
     if action:
         query = query.filter(AuthLog.action == action)
+    
+    # Date range filter
+    if date_from:
+        try:
+            from_date = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+            query = query.filter(AuthLog.timestamp >= from_date)
+        except:
+            pass
+    if date_to:
+        try:
+            to_date = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+            query = query.filter(AuthLog.timestamp <= to_date)
+        except:
+            pass
     
     # Get total count
     total = query.count()
@@ -559,10 +614,12 @@ async def get_scan_logs(
     per_page: int = 50,
     officer_id: Optional[int] = None,
     match_only: bool = True,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """Get scan logs with pagination (admin only). By default shows only matches."""
+    """Get scan logs with pagination and advanced filters (admin only). By default shows only matches."""
     query = db.query(ScanLog).join(User, ScanLog.officer_id == User.id)
     
     # Apply filters
@@ -570,6 +627,20 @@ async def get_scan_logs(
         query = query.filter(ScanLog.officer_id == officer_id)
     if match_only:
         query = query.filter(ScanLog.match_found == True)
+    
+    # Date range filter
+    if date_from:
+        try:
+            from_date = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+            query = query.filter(ScanLog.timestamp >= from_date)
+        except:
+            pass
+    if date_to:
+        try:
+            to_date = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+            query = query.filter(ScanLog.timestamp <= to_date)
+        except:
+            pass
     
     # Get total count
     total = query.count()
@@ -612,6 +683,18 @@ async def get_scan_logs(
     return ScanLogList(logs=log_responses, total=total, page=page, per_page=per_page)
 
 
+# ==================== Get Officers List (for filters) ====================
+
+@app.get("/api/officers", tags=["Logs"])
+async def get_officers_list(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get list of officers for filter dropdowns."""
+    officers = db.query(User).filter(User.role == "officer").all()
+    return [{"id": o.id, "username": o.username, "full_name": o.full_name} for o in officers]
+
+
 # ==================== Dashboard Statistics (Admin Only) ====================
 
 @app.get("/api/dashboard/stats", response_model=DashboardStats, tags=["Dashboard"])
@@ -619,10 +702,11 @@ async def get_dashboard_stats(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """Get dashboard statistics (admin only)."""
+    """Get dashboard statistics (admin only) with advanced analytics."""
     now = datetime.now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = today_start - timedelta(days=7)
+    month_start = today_start - timedelta(days=30)
     
     # Counts
     total_visitors = db.query(Visitor).count()
@@ -639,6 +723,35 @@ async def get_dashboard_stats(
     total_matches_week = db.query(ScanLog).filter(
         and_(ScanLog.timestamp >= week_start, ScanLog.match_found == True)
     ).count()
+    
+    # Month's scans
+    total_scans_month = db.query(ScanLog).filter(ScanLog.timestamp >= month_start).count()
+    total_matches_month = db.query(ScanLog).filter(
+        and_(ScanLog.timestamp >= month_start, ScanLog.match_found == True)
+    ).count()
+    
+    # Calculate match rates
+    match_rate_today = (total_matches_today / total_scans_today * 100) if total_scans_today > 0 else 0
+    match_rate_week = (total_matches_week / total_scans_week * 100) if total_scans_week > 0 else 0
+    
+    # Top 5 most active officers (this week)
+    top_officers_query = db.query(
+        User.id,
+        User.username,
+        User.full_name,
+        func.count(ScanLog.id).label('scan_count')
+    ).join(ScanLog, User.id == ScanLog.officer_id).filter(
+        ScanLog.timestamp >= week_start
+    ).group_by(User.id).order_by(func.count(ScanLog.id).desc()).limit(5).all()
+    
+    top_officers = [
+        TopOfficer(
+            id=officer.id,
+            username=officer.username,
+            full_name=officer.full_name,
+            scan_count=officer.scan_count
+        ) for officer in top_officers_query
+    ]
     
     # Recent scans (last 10 matches)
     recent_logs = db.query(ScanLog).filter(ScanLog.match_found == True).order_by(
@@ -682,9 +795,244 @@ async def get_dashboard_stats(
         total_matches_today=total_matches_today,
         total_scans_week=total_scans_week,
         total_matches_week=total_matches_week,
+        total_scans_month=total_scans_month,
+        total_matches_month=total_matches_month,
+        match_rate_today=round(match_rate_today, 1),
+        match_rate_week=round(match_rate_week, 1),
+        top_officers=top_officers,
         recent_scans=recent_scans,
         system_status="operational"
     )
+
+
+# ==================== Export to CSV (Admin Only) ====================
+
+@app.get("/api/export/auth-logs", tags=["Export"])
+async def export_auth_logs(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    user_id: Optional[int] = None,
+    action: Optional[str] = None,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Export authentication logs to CSV."""
+    query = db.query(AuthLog).join(User)
+    
+    # Apply filters
+    if user_id:
+        query = query.filter(AuthLog.user_id == user_id)
+    if action:
+        query = query.filter(AuthLog.action == action)
+    if date_from:
+        try:
+            from_date = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+            query = query.filter(AuthLog.timestamp >= from_date)
+        except:
+            pass
+    if date_to:
+        try:
+            to_date = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+            query = query.filter(AuthLog.timestamp <= to_date)
+        except:
+            pass
+    
+    logs = query.order_by(AuthLog.timestamp.desc()).limit(5000).all()
+    
+    # Create CSV
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'المستخدم', 'الاسم الكامل', 'الإجراء', 'التاريخ والوقت', 'عنوان IP', 'الموقع'])
+    
+    for log in logs:
+        user = db.query(User).filter(User.id == log.user_id).first()
+        writer.writerow([
+            log.id,
+            user.username if user else 'unknown',
+            user.full_name if user else 'unknown',
+            'تسجيل دخول' if log.action == 'login' else 'تسجيل خروج',
+            log.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+            log.ip_address or '',
+            log.location or ''
+        ])
+    
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=auth_logs_{datetime.now().strftime('%Y%m%d')}.csv"}
+    )
+
+
+@app.get("/api/export/scan-logs", tags=["Export"])
+async def export_scan_logs(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    officer_id: Optional[int] = None,
+    match_only: bool = True,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Export scan logs to CSV."""
+    query = db.query(ScanLog).join(User, ScanLog.officer_id == User.id)
+    
+    # Apply filters
+    if officer_id:
+        query = query.filter(ScanLog.officer_id == officer_id)
+    if match_only:
+        query = query.filter(ScanLog.match_found == True)
+    if date_from:
+        try:
+            from_date = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+            query = query.filter(ScanLog.timestamp >= from_date)
+        except:
+            pass
+    if date_to:
+        try:
+            to_date = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+            query = query.filter(ScanLog.timestamp <= to_date)
+        except:
+            pass
+    
+    logs = query.order_by(ScanLog.timestamp.desc()).limit(5000).all()
+    
+    # Create CSV
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'العسكري', 'الزائر', 'رقم الجواز', 'نوع التأشيرة', 'نتيجة المسح', 'التاريخ والوقت', 'عنوان IP'])
+    
+    for log in logs:
+        officer = db.query(User).filter(User.id == log.officer_id).first()
+        visitor = db.query(Visitor).filter(Visitor.id == log.visitor_id).first() if log.visitor_id else None
+        writer.writerow([
+            log.id,
+            officer.full_name if officer else 'unknown',
+            visitor.full_name if visitor else 'غير معروف',
+            visitor.passport_number if visitor else '',
+            visitor.visa_status if visitor else '',
+            'تطابق' if log.match_found else 'لا يوجد تطابق',
+            log.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+            log.ip_address or ''
+        ])
+    
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=scan_logs_{datetime.now().strftime('%Y%m%d')}.csv"}
+    )
+
+
+@app.get("/api/export/visitors", tags=["Export"])
+async def export_visitors(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Export visitors list to CSV."""
+    visitors = db.query(Visitor).order_by(Visitor.created_at.desc()).limit(5000).all()
+    
+    # Create CSV
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'الاسم الكامل', 'رقم الجواز', 'نوع التأشيرة', 'تاريخ التسجيل'])
+    
+    for visitor in visitors:
+        writer.writerow([
+            visitor.id,
+            visitor.full_name,
+            visitor.passport_number,
+            visitor.visa_status,
+            visitor.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        ])
+    
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=visitors_{datetime.now().strftime('%Y%m%d')}.csv"}
+    )
+
+
+# ==================== Notifications (Admin Only) ====================
+
+@app.get("/api/notifications", response_model=NotificationList, tags=["Notifications"])
+async def get_notifications(
+    page: int = 1,
+    per_page: int = 20,
+    unread_only: bool = False,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get notifications for admin."""
+    query = db.query(Notification)
+    
+    if unread_only:
+        query = query.filter(Notification.is_read == False)
+    
+    total = query.count()
+    unread_count = db.query(Notification).filter(Notification.is_read == False).count()
+    
+    offset = (page - 1) * per_page
+    notifications = query.order_by(Notification.created_at.desc()).offset(offset).limit(per_page).all()
+    
+    return NotificationList(
+        notifications=[
+            NotificationResponse(
+                id=n.id,
+                type=n.type,
+                title=n.title,
+                message=n.message,
+                timestamp=n.created_at,
+                is_read=n.is_read,
+                user_id=n.user_id,
+                metadata=n.metadata
+            ) for n in notifications
+        ],
+        total=total,
+        unread_count=unread_count
+    )
+
+
+@app.patch("/api/notifications/{notification_id}/read", tags=["Notifications"])
+async def mark_notification_read(
+    notification_id: int,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Mark a notification as read."""
+    notification = db.query(Notification).filter(Notification.id == notification_id).first()
+    if not notification:
+        raise HTTPException(status_code=404, detail="الإشعار غير موجود")
+    
+    notification.is_read = True
+    db.commit()
+    return {"success": True, "message": "تم تحديث الإشعار"}
+
+
+@app.patch("/api/notifications/read-all", tags=["Notifications"])
+async def mark_all_notifications_read(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Mark all notifications as read."""
+    db.query(Notification).filter(Notification.is_read == False).update({"is_read": True})
+    db.commit()
+    return {"success": True, "message": "تم تحديث جميع الإشعارات"}
+
+
+# Helper function to create notification
+def create_notification(db: Session, type: str, title: str, message: str, user_id: int = None, metadata: dict = None):
+    """Create a new notification."""
+    notification = Notification(
+        type=type,
+        title=title,
+        message=message,
+        user_id=user_id,
+        metadata=metadata
+    )
+    db.add(notification)
+    db.commit()
+    return notification
 
 
 # ==================== Visitor Management (Admin Only) ====================

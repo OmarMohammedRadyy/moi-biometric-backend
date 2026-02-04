@@ -135,3 +135,35 @@ class Visitor(Base):
 
     def __repr__(self):
         return f"<Visitor(id={self.id}, name={self.full_name}, passport={self.passport_number})>"
+
+
+class Notification(Base):
+    """
+    Notification model for system notifications to admins.
+    
+    Attributes:
+        id: Primary key
+        type: Notification type (account_disabled, failed_login, system_alert)
+        title: Notification title
+        message: Notification message
+        user_id: Related user ID (optional)
+        metadata: Additional data as JSON
+        is_read: Whether the notification has been read
+        created_at: Timestamp when notification was created
+    """
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    type = Column(String(50), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    message = Column(Text, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    metadata = Column(JSON, nullable=True)
+    is_read = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    # Relationships
+    user = relationship("User", backref="notifications")
+
+    def __repr__(self):
+        return f"<Notification(id={self.id}, type={self.type}, is_read={self.is_read})>"

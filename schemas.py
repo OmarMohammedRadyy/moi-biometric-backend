@@ -180,6 +180,13 @@ class ErrorResponse(BaseModel):
 
 # ==================== Dashboard Statistics ====================
 
+class TopOfficer(BaseModel):
+    """Schema for top active officer"""
+    id: int
+    username: str
+    full_name: str
+    scan_count: int
+
 class DashboardStats(BaseModel):
     """Schema for admin dashboard statistics"""
     total_visitors: int
@@ -188,5 +195,45 @@ class DashboardStats(BaseModel):
     total_matches_today: int
     total_scans_week: int
     total_matches_week: int
+    total_scans_month: int
+    total_matches_month: int
+    match_rate_today: float
+    match_rate_week: float
+    top_officers: List[TopOfficer]
     recent_scans: List[ScanLogResponse]
     system_status: str
+
+
+# ==================== Notifications ====================
+
+class NotificationResponse(BaseModel):
+    """Schema for notification"""
+    id: int
+    type: str  # "account_disabled", "failed_login", "system_alert"
+    title: str
+    message: str
+    timestamp: datetime
+    is_read: bool
+    user_id: Optional[int] = None
+    metadata: Optional[dict] = None
+
+    class Config:
+        from_attributes = True
+
+
+class NotificationList(BaseModel):
+    """Schema for list of notifications"""
+    notifications: List[NotificationResponse]
+    total: int
+    unread_count: int
+
+
+# ==================== Export Schemas ====================
+
+class ExportRequest(BaseModel):
+    """Schema for export request"""
+    type: str = Field(..., description="Export type: auth_logs, scan_logs, visitors")
+    date_from: Optional[datetime] = None
+    date_to: Optional[datetime] = None
+    officer_id: Optional[int] = None
+    match_only: Optional[bool] = None

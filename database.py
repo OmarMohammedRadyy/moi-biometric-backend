@@ -55,7 +55,7 @@ def init_db():
 
 
 def run_migrations():
-    """Run database migrations for new columns"""
+    """Run database migrations for new columns and tables"""
     try:
         from sqlalchemy import text
         with engine.begin() as connection:
@@ -71,6 +71,24 @@ def run_migrations():
                     END IF;
                 END $$;
             """))
+            
+            # Create notifications table if it doesn't exist
+            connection.execute(text("""
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id SERIAL PRIMARY KEY,
+                    type VARCHAR(50) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    message TEXT NOT NULL,
+                    user_id INTEGER REFERENCES users(id),
+                    metadata JSON,
+                    is_read BOOLEAN DEFAULT FALSE NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS ix_notifications_id ON notifications(id);
+                CREATE INDEX IF NOT EXISTS ix_notifications_type ON notifications(type);
+                CREATE INDEX IF NOT EXISTS ix_notifications_created_at ON notifications(created_at);
+            """))
+            
         print("✅ Migrations completed.", flush=True)
     except Exception as e:
         print(f"⚠️ Migration note: {e}", flush=True)
