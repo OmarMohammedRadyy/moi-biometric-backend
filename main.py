@@ -652,6 +652,71 @@ async def toggle_user_status(
     )
 
 
+class UserUpdate(BaseModel):
+    """Schema for updating user data"""
+    username: Optional[str] = None
+    full_name: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+
+
+@app.put("/api/users/{user_id}", response_model=UserResponse, tags=["User Management"])
+async def update_user(
+    user_id: int,
+    user_data: UserUpdate,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Update user information (admin only)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="المستخدم غير موجود"
+        )
+    
+    # Update fields if provided
+    if user_data.username:
+        # Check if username already exists for another user
+        existing = db.query(User).filter(
+            User.username == user_data.username,
+            User.id != user_id
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="اسم المستخدم موجود مسبقاً"
+            )
+        user.username = user_data.username
+    
+    if user_data.full_name:
+        user.full_name = user_data.full_name
+    
+    if user_data.password:
+        user.password_hash = hash_password(user_data.password)
+    
+    if user_data.role and user_data.role in ["admin", "officer"]:
+        # Prevent admin from changing their own role
+        if user.id == admin["user_id"] and user_data.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="لا يمكنك تغيير صلاحياتك الخاصة"
+            )
+        user.role = user_data.role
+    
+    db.commit()
+    db.refresh(user)
+    
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        full_name=user.full_name,
+        role=user.role,
+        is_active=user.is_active,
+        created_at=user.created_at
+    )
+
+
 @app.delete("/api/users/{user_id}", response_model=MessageResponse, tags=["User Management"])
 async def delete_user(
     user_id: int,
@@ -674,6 +739,18 @@ async def delete_user(
         )
     
     username = user.username
+    
+    # Delete related records first to avoid foreign key constraint errors
+    # Delete auth logs
+    db.query(AuthLog).filter(AuthLog.user_id == user_id).delete()
+    
+    # Delete scan logs (set officer_id to NULL or delete)
+    db.query(ScanLog).filter(ScanLog.officer_id == user_id).delete()
+    
+    # Delete notifications
+    db.query(Notification).filter(Notification.user_id == user_id).delete()
+    
+    # Now delete the user
     db.delete(user)
     db.commit()
     
