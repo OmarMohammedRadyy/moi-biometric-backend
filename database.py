@@ -89,6 +89,19 @@ def run_migrations():
                 CREATE INDEX IF NOT EXISTS ix_notifications_created_at ON notifications(created_at);
             """))
             
+            # Add permissions column to users table if it doesn't exist
+            connection.execute(text("""
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='users' AND column_name='permissions'
+                    ) THEN 
+                        ALTER TABLE users ADD COLUMN permissions JSON DEFAULT '["scanner"]';
+                    END IF;
+                END $$;
+            """))
+            
         print("✅ Migrations completed.", flush=True)
     except Exception as e:
         print(f"⚠️ Migration note: {e}", flush=True)

@@ -34,7 +34,7 @@ from pydantic import BaseModel
 from deepface import DeepFace
 
 from database import get_db, init_db, engine, Base
-from models import Visitor, User, AuthLog, ScanLog, Notification
+from models import Visitor, User, AuthLog, ScanLog, Notification, SYSTEM_PAGES, DEFAULT_OFFICER_PERMISSIONS
 from schemas import (
     VisitorResponse,
     VisitorList,
@@ -755,6 +755,161 @@ async def delete_user(
     db.commit()
     
     return MessageResponse(success=True, message=f"تم حذف المستخدم {username}")
+
+
+# ==================== Permissions Management (Admin Only) ====================
+
+@app.get("/api/permissions/pages", tags=["Permissions"])
+async def get_available_pages(
+    admin: dict = Depends(require_admin)
+):
+    """Get list of all available system pages."""
+    return {
+        "pages": SYSTEM_PAGES,
+        "default_officer_permissions": DEFAULT_OFFICER_PERMISSIONS
+    }
+
+
+@app.get("/api/permissions/users", tags=["Permissions"])
+async def get_users_permissions(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Get all officers with their permissions."""
+    officers = db.query(User).filter(User.role == "officer").all()
+    
+    return {
+        "users": [
+            {
+                "id": u.id,
+                "username": u.username,
+                "full_name": u.full_name,
+                "is_active": u.is_active,
+                "permissions": u.permissions or DEFAULT_OFFICER_PERMISSIONS
+            }
+            for u in officers
+        ]
+    }
+
+
+class PermissionUpdate(BaseModel):
+    permissions: list
+
+
+@app.put("/api/permissions/users/{user_id}", tags=["Permissions"])
+async def update_user_permissions(
+    user_id: int,
+    data: PermissionUpdate,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Update a user's page permissions (admin only)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="المستخدم غير موجود"
+        )
+    
+    if user.role == "admin":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="لا يمكن تعديل صلاحيات المدير - المدير لديه جميع الصلاحيات"
+        )
+    
+    # Validate permissions
+    valid_page_ids = [p["id"] for p in SYSTEM_PAGES]
+    invalid_perms = [p for p in data.permissions if p not in valid_page_ids]
+    if invalid_perms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"صلاحيات غير صالحة: {invalid_perms}"
+        )
+    
+    user.permissions = data.permissions
+    db.commit()
+    db.refresh(user)
+    
+    return {
+        "success": True,
+        "message": f"تم تحديث صلاحيات {user.full_name}",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "full_name": user.full_name,
+            "permissions": user.permissions
+        }
+    }
+
+
+@app.get("/api/permissions/check/{page_id}", tags=["Permissions"])
+async def check_page_permission(
+    page_id: str,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Check if current user has permission to access a page."""
+    auth_token = get_token_from_header(authorization)
+    if not auth_token:
+        return {"allowed": False, "message": "غير مصرح - يرجى تسجيل الدخول"}
+    
+    user_data = verify_token(auth_token)
+    if not user_data:
+        return {"allowed": False, "message": "الجلسة غير صالحة أو منتهية"}
+    
+    user = db.query(User).filter(User.id == user_data["user_id"]).first()
+    if not user:
+        return {"allowed": False, "message": "المستخدم غير موجود"}
+    
+    if not user.is_active:
+        return {"allowed": False, "message": "الحساب معطّل"}
+    
+    # Admins have all permissions
+    if user.role == "admin":
+        return {"allowed": True, "message": "مسموح"}
+    
+    # Check officer permissions
+    permissions = user.permissions or DEFAULT_OFFICER_PERMISSIONS
+    if page_id in permissions:
+        return {"allowed": True, "message": "مسموح"}
+    
+    return {
+        "allowed": False,
+        "message": "غير مصرح لك بالدخول لهذه الصفحة"
+    }
+
+
+@app.get("/api/user/permissions", tags=["Permissions"])
+async def get_my_permissions(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Get current user's permissions."""
+    auth_token = get_token_from_header(authorization)
+    if not auth_token:
+        raise HTTPException(status_code=401, detail="غير مصرح")
+    
+    user_data = verify_token(auth_token)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="الجلسة غير صالحة")
+    
+    user = db.query(User).filter(User.id == user_data["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="المستخدم غير موجود")
+    
+    # Admins have all permissions
+    if user.role == "admin":
+        return {
+            "role": "admin",
+            "permissions": [p["id"] for p in SYSTEM_PAGES],
+            "all_pages": True
+        }
+    
+    return {
+        "role": "officer",
+        "permissions": user.permissions or DEFAULT_OFFICER_PERMISSIONS,
+        "all_pages": False
+    }
 
 
 # ==================== Auth Logs (Admin Only) ====================

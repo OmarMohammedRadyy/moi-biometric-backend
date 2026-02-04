@@ -8,6 +8,22 @@ from sqlalchemy.orm import relationship
 from database import Base
 
 
+# Available pages in the system
+SYSTEM_PAGES = [
+    {"id": "scanner", "name": "الماسح الأمني", "description": "صفحة المسح البيومتري"},
+    {"id": "visitors", "name": "إدارة الزوار", "description": "إضافة وتعديل وحذف الزوار"},
+    {"id": "users", "name": "إدارة المستخدمين", "description": "إدارة حسابات العساكر والمديرين"},
+    {"id": "auth_logs", "name": "سجل الدخول", "description": "سجل عمليات تسجيل الدخول والخروج"},
+    {"id": "scan_logs", "name": "سجل المسح", "description": "سجل عمليات المسح الأمني"},
+    {"id": "notifications", "name": "الإشعارات", "description": "إشعارات النظام"},
+    {"id": "dashboard", "name": "لوحة المعلومات", "description": "الإحصائيات والرسوم البيانية"},
+    {"id": "permissions", "name": "إدارة الصلاحيات", "description": "تحديد صلاحيات المستخدمين"},
+]
+
+# Default permissions for officers (scanner only)
+DEFAULT_OFFICER_PERMISSIONS = ["scanner"]
+
+
 class User(Base):
     """
     User model for system users (admins and officers).
@@ -19,6 +35,7 @@ class User(Base):
         full_name: User's full name (اسم العسكري)
         role: User role - "admin" or "officer"
         is_active: Whether the account is active
+        permissions: JSON array of allowed page IDs
         created_at: Timestamp when record was created
         created_by: ID of the admin who created this user
     """
@@ -30,6 +47,7 @@ class User(Base):
     full_name = Column(String(255), nullable=False)
     role = Column(String(20), nullable=False, default="officer")  # "admin" or "officer"
     is_active = Column(Boolean, default=True, nullable=False)
+    permissions = Column(JSON, nullable=True, default=list)  # List of allowed page IDs
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     
@@ -39,6 +57,19 @@ class User(Base):
 
     def __repr__(self):
         return f"<User(id={self.id}, username={self.username}, role={self.role})>"
+    
+    def get_permissions(self):
+        """Get user's permissions. Admins have all permissions."""
+        if self.role == "admin":
+            return [p["id"] for p in SYSTEM_PAGES]
+        return self.permissions or DEFAULT_OFFICER_PERMISSIONS
+    
+    def has_permission(self, page_id: str) -> bool:
+        """Check if user has permission to access a page."""
+        if self.role == "admin":
+            return True
+        perms = self.permissions or DEFAULT_OFFICER_PERMISSIONS
+        return page_id in perms
 
 
 class AuthLog(Base):
