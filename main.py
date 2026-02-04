@@ -570,7 +570,9 @@ async def startup_event():
     
     print(f"🧠 Face Recognition Model: {FACE_MODEL}")
     print(f"📏 Distance Metric: {DISTANCE_METRIC}")
-    print(f"🎯 Match Threshold: {MATCH_THRESHOLD}")
+    print(f"🎯 Thresholds: HIGH={THRESHOLD_HIGH}, MEDIUM={THRESHOLD_MEDIUM}, LOW={THRESHOLD_LOW}")
+    print(f"🔍 Detector: {DETECTOR_BACKEND}")
+    print(f"🛡️ Security: Anti-Spoofing, Rate Limiting, Quality Check")
 
 
 # ==================== Health Check ====================
@@ -1816,7 +1818,11 @@ async def get_statistics(
         "system_status": "operational",
         "face_recognition_model": FACE_MODEL,
         "distance_metric": DISTANCE_METRIC,
-        "match_threshold": MATCH_THRESHOLD
+        "thresholds": {
+            "high": THRESHOLD_HIGH,
+            "medium": THRESHOLD_MEDIUM,
+            "low": THRESHOLD_LOW
+        }
     }
 
 
