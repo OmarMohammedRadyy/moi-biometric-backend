@@ -73,19 +73,29 @@ MATCH_THRESHOLD = 0.40
 app = FastAPI(
     title="MOI Biometric System",
     description="Kuwait Ministry of Interior - Facial Recognition Security System",
-    version="3.0.0",
+    version="3.5.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
 
-# CORS Middleware - Must be added before any routes
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
-    allow_credentials=False,  # Must be False when using "*"
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Custom CORS middleware to ensure headers are always sent
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    # Handle preflight OPTIONS requests
+    if request.method == "OPTIONS":
+        response = JSONResponse(content={}, status_code=200)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Max-Age"] = "3600"
+        return response
+    
+    # Process request and add CORS headers to response
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 # Mount uploads directory
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
