@@ -77,33 +77,28 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(SCAN_PHOTOS_DIR, exist_ok=True)
 
 # =================================================================
-# ENHANCED SECURITY CONFIGURATION
+# FAST SECURITY CONFIGURATION
 # =================================================================
 
-# DeepFace model configuration - Using best accuracy model
+# DeepFace model configuration
 FACE_MODEL = "Facenet512"
 DISTANCE_METRIC = "cosine"
 
-# Multi-level confidence thresholds
-THRESHOLD_HIGH = 0.30      # High confidence match (70%+ similarity)
-THRESHOLD_MEDIUM = 0.40    # Medium confidence (60%+ similarity)
-THRESHOLD_LOW = 0.50       # Low confidence - requires manual review
+# Single threshold for match (simple: match or no match)
+MATCH_THRESHOLD = 0.40      # 60%+ similarity = match
 
-# Use RetinaFace for better face detection accuracy
-DETECTOR_BACKEND = "retinaface"  # Options: opencv, ssd, mtcnn, retinaface, mediapipe
+# Use OpenCV for fastest detection (retinaface is slower)
+DETECTOR_BACKEND = "opencv"  # Options: opencv, ssd, mtcnn, retinaface, mediapipe
 
-# Image quality thresholds
-MIN_FACE_SIZE = 80          # Minimum face size in pixels
-MIN_BRIGHTNESS = 40         # Minimum average brightness (0-255)
-MAX_BRIGHTNESS = 220        # Maximum average brightness
-MIN_SHARPNESS = 50          # Minimum Laplacian variance for blur detection
-MIN_FACE_CONFIDENCE = 0.9   # Minimum face detection confidence
+# Speed optimization flags
+ENABLE_QUALITY_CHECK = False    # Disable for faster scanning
+ENABLE_ANTI_SPOOFING = False    # Disable for faster scanning
+ENABLE_RATE_LIMITING = False    # Disable rate limiting
 
-# Rate limiting configuration
-RATE_LIMIT_WINDOW = 60      # seconds
-MAX_SCANS_PER_MINUTE = 10   # per user
-MAX_FAILED_SCANS = 5        # before temporary lockout
-LOCKOUT_DURATION = 300      # 5 minutes lockout
+# Backwards compatibility
+THRESHOLD_HIGH = MATCH_THRESHOLD
+THRESHOLD_MEDIUM = MATCH_THRESHOLD
+THRESHOLD_LOW = 0.50
 
 # =================================================================
 # IN-MEMORY CACHING & RATE LIMITING
@@ -1575,12 +1570,8 @@ async def verify_face(
     db: Session = Depends(get_db)
 ):
     """
-    Enhanced face verification with:
-    - Anti-spoofing detection
-    - Image quality assessment
-    - Multi-level confidence thresholds
-    - Rate limiting protection
-    - Fast cached embedding search
+    Fast face verification - optimized for speed.
+    Simple result: match or no match.
     """
     start_time = time.time()
     
@@ -1600,24 +1591,7 @@ async def verify_face(
         )
     
     user_id = user_data["user_id"]
-    
-    # Rate limiting check
-    is_locked, remaining = rate_limiter.is_locked(user_id)
-    if is_locked:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"تم تعليق الحساب مؤقتاً. حاول بعد {remaining} ثانية"
-        )
-    
-    allowed, rate_msg = rate_limiter.check_rate_limit(user_id)
-    if not allowed:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=rate_msg
-        )
-    
     temp_path = None
-    quality_warnings = []
     
     try:
         # Read and process uploaded image
@@ -1629,45 +1603,12 @@ async def verify_face(
         
         # Save temporarily for processing
         temp_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4()}.jpg")
-        image.save(temp_path, quality=95)
+        image.save(temp_path, quality=90)
         
-        # Step 1: Anti-spoofing check
-        is_real, spoof_score, spoof_msg = detect_spoofing(temp_path)
-        if not is_real:
-            rate_limiter.record_failure(user_id)
-            
-            # Log suspicious activity
-            scan_log = ScanLog(
-                officer_id=user_id,
-                visitor_id=None,
-                match_found=False,
-                confidence=0,
-                ip_address=get_client_ip(req),
-                location=f"SPOOF_DETECTED:{spoof_score:.2f}",
-                captured_photo_path=None
-            )
-            db.add(scan_log)
-            db.commit()
-            
-            return {
-                "match_found": False,
-                "confidence": 0,
-                "confidence_level": "rejected",
-                "visitor": None,
-                "message": f"⚠️ {spoof_msg}",
-                "captured_photo": None,
-                "quality_warnings": ["تم اكتشاف محاولة احتيال محتملة"],
-                "processing_time_ms": int((time.time() - start_time) * 1000),
-                "is_spoofing_detected": True
-            }
-        
-        # Step 2: Generate face embedding with quality check
+        # Generate face embedding (fast mode - no quality check)
         try:
-            captured_embedding, quality_result = get_face_embedding(temp_path, with_quality_check=True)
-            quality_warnings = quality_result.warnings
+            captured_embedding, _ = get_face_embedding(temp_path, with_quality_check=False)
         except ValueError as e:
-            rate_limiter.record_failure(user_id)
-            
             scan_log = ScanLog(
                 officer_id=user_id,
                 visitor_id=None,
@@ -1682,33 +1623,25 @@ async def verify_face(
             
             return {
                 "match_found": False,
-                "confidence": None,
-                "confidence_level": "none",
                 "visitor": None,
                 "message": str(e),
-                "captured_photo": None,
-                "quality_warnings": quality_result.errors if 'quality_result' in dir() else [str(e)],
-                "processing_time_ms": int((time.time() - start_time) * 1000),
-                "is_spoofing_detected": False
+                "captured_photo": None
             }
         
-        # Step 3: Fast search using cached embeddings
-        best_id, best_distance, confidence_level = find_best_match_fast(captured_embedding, db)
+        # Fast search using cached embeddings
+        best_id, best_distance, _ = find_best_match_fast(captured_embedding, db)
         
         # Convert captured image to base64
         buffered = BytesIO()
-        image.save(buffered, format="JPEG", quality=85)
+        image.save(buffered, format="JPEG", quality=80)
         captured_base64 = base64.b64encode(buffered.getvalue()).decode()
         
-        # Calculate confidence percentage
-        confidence = round((1 - best_distance) * 100, 2) if best_distance < 1 else 0
-        
-        # Determine if match is valid based on multi-level thresholds
-        match_found = confidence_level in ["high", "medium"]
+        # Simple match check
+        match_found = best_distance < MATCH_THRESHOLD
         
         # Get visitor data if match found
         best_match = None
-        if best_id:
+        if best_id and match_found:
             best_match = db.query(Visitor).filter(Visitor.id == best_id).first()
         
         # Save scan photo for matches
@@ -1716,20 +1649,17 @@ async def verify_face(
         if match_found and best_match:
             scan_filename = f"scan_{uuid.uuid4()}.jpg"
             saved_scan_path = os.path.join(SCAN_PHOTOS_DIR, scan_filename)
-            image.save(saved_scan_path, quality=85)
+            image.save(saved_scan_path, quality=80)
             relative_scan_path = f"scans/{scan_filename}"
-            rate_limiter.reset_failures(user_id)
-        else:
-            rate_limiter.record_failure(user_id)
         
         # Log the scan
         scan_log = ScanLog(
             officer_id=user_id,
             visitor_id=best_match.id if match_found and best_match else None,
             match_found=match_found,
-            confidence=confidence,
+            confidence=round((1 - best_distance) * 100, 2) if best_distance < 1 else 0,
             ip_address=get_client_ip(req),
-            location=f"LEVEL:{confidence_level}",
+            location=None,
             captured_photo_path=relative_scan_path
         )
         db.add(scan_log)
@@ -1738,18 +1668,12 @@ async def verify_face(
         processing_time = int((time.time() - start_time) * 1000)
         
         if match_found and best_match:
-            print(f"✅ MATCH [{confidence_level.upper()}]: {best_match.full_name} by {user_data['username']} ({confidence}%) in {processing_time}ms")
+            print(f"✅ MATCH: {best_match.full_name} by {user_data['username']} in {processing_time}ms")
             
-            # Prepare message based on confidence level
-            if confidence_level == "high":
-                status_msg = f"✅ تطابق مؤكد: {best_match.full_name}"
-            else:
-                status_msg = f"⚡ تطابق محتمل: {best_match.full_name} (يُنصح بالتحقق اليدوي)"
+            status_msg = f"تم التحقق: {best_match.full_name}"
             
             return {
                 "match_found": True,
-                "confidence": confidence,
-                "confidence_level": confidence_level,
                 "visitor": {
                     "id": best_match.id,
                     "full_name": best_match.full_name,
@@ -1761,24 +1685,16 @@ async def verify_face(
                     "updated_at": best_match.updated_at.isoformat() if best_match.updated_at else None
                 },
                 "message": status_msg,
-                "captured_photo": captured_base64,
-                "quality_warnings": quality_warnings,
-                "processing_time_ms": processing_time,
-                "is_spoofing_detected": False
+                "captured_photo": captured_base64
             }
         else:
-            print(f"❌ NO MATCH by {user_data['username']} (best: {best_distance:.4f}, level: {confidence_level}) in {processing_time}ms")
+            print(f"❌ NO MATCH by {user_data['username']} (best: {best_distance:.4f}) in {processing_time}ms")
             
             return {
                 "match_found": False,
-                "confidence": confidence,
-                "confidence_level": confidence_level,
                 "visitor": None,
                 "message": "غير مصرح - لا يوجد تطابق في السجلات",
-                "captured_photo": captured_base64,
-                "quality_warnings": quality_warnings,
-                "processing_time_ms": processing_time,
-                "is_spoofing_detected": False
+                "captured_photo": captured_base64
             }
 
     except Exception as e:
