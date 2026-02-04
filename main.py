@@ -329,6 +329,42 @@ async def require_admin(
     return user_data
 
 
+def check_page_permission(user_data: dict, page_id: str, db: Session) -> bool:
+    """Check if user has permission to access a specific page."""
+    # Admins have all permissions
+    if user_data.get("role") == "admin":
+        return True
+    
+    # Get user from DB to check permissions
+    user = db.query(User).filter(User.id == user_data.get("user_id")).first()
+    if not user:
+        return False
+    
+    # Check user permissions
+    permissions = user.permissions or DEFAULT_OFFICER_PERMISSIONS
+    return page_id in permissions
+
+
+def require_permission(page_id: str):
+    """Factory function to create permission dependency for a specific page."""
+    async def permission_checker(
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = None,
+        db: Session = Depends(get_db)
+    ) -> dict:
+        user_data = await require_auth(authorization, token)
+        
+        if not check_page_permission(user_data, page_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"ليس لديك صلاحية للوصول لهذه الصفحة"
+            )
+        
+        return user_data
+    
+    return permission_checker
+
+
 # ==================== Startup Event ====================
 
 @app.on_event("startup")
@@ -400,9 +436,9 @@ async def health_check():
 
 @app.get("/api/security/status", tags=["Security"])
 async def security_status(
-    admin: dict = Depends(require_admin)
+    user: dict = Depends(require_permission("dashboard"))
 ):
-    """Get security system status (admin only)."""
+    """Get security system status."""
     return {
         "face_model": FACE_MODEL,
         "detector_backend": DETECTOR_BACKEND,
@@ -549,10 +585,10 @@ async def get_current_user(user_data: dict = Depends(require_auth)):
 @app.post("/api/users", response_model=UserResponse, tags=["User Management"])
 async def create_user(
     user_data: UserCreate,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("users")),
     db: Session = Depends(get_db)
 ):
-    """Create a new user (admin only)."""
+    """Create a new user."""
     # Check if username exists
     existing = db.query(User).filter(User.username == user_data.username).first()
     if existing:
@@ -582,10 +618,10 @@ async def create_user(
 
 @app.get("/api/users", response_model=UserList, tags=["User Management"])
 async def list_users(
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("users")),
     db: Session = Depends(get_db)
 ):
-    """Get all users (admin only)."""
+    """Get all users."""
     users = db.query(User).order_by(User.created_at.desc()).all()
     return UserList(users=users, total=len(users))
 
@@ -593,10 +629,10 @@ async def list_users(
 @app.get("/api/users/{user_id}", response_model=UserResponse, tags=["User Management"])
 async def get_user(
     user_id: int,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("users")),
     db: Session = Depends(get_db)
 ):
-    """Get a specific user by ID (admin only)."""
+    """Get a specific user by ID."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(
@@ -609,10 +645,10 @@ async def get_user(
 @app.patch("/api/users/{user_id}/toggle", response_model=UserToggleResponse, tags=["User Management"])
 async def toggle_user_status(
     user_id: int,
-    admin: dict = Depends(require_admin),
+    current_user: dict = Depends(require_permission("users")),
     db: Session = Depends(get_db)
 ):
-    """Toggle user active status (admin only)."""
+    """Toggle user active status."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(
@@ -620,8 +656,8 @@ async def toggle_user_status(
             detail="المستخدم غير موجود"
         )
     
-    # Prevent admin from disabling themselves
-    if user.id == admin["user_id"]:
+    # Prevent user from disabling themselves
+    if user.id == current_user["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="لا يمكنك تعطيل حسابك الخاص"
@@ -664,10 +700,10 @@ class UserUpdate(BaseModel):
 async def update_user(
     user_id: int,
     user_data: UserUpdate,
-    admin: dict = Depends(require_admin),
+    current_user: dict = Depends(require_permission("users")),
     db: Session = Depends(get_db)
 ):
-    """Update user information (admin only)."""
+    """Update user information."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(
@@ -720,10 +756,10 @@ async def update_user(
 @app.delete("/api/users/{user_id}", response_model=MessageResponse, tags=["User Management"])
 async def delete_user(
     user_id: int,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("users")),
     db: Session = Depends(get_db)
 ):
-    """Delete a user (admin only)."""
+    """Delete a user."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(
@@ -761,7 +797,7 @@ async def delete_user(
 
 @app.get("/api/permissions/pages", tags=["Permissions"])
 async def get_available_pages(
-    admin: dict = Depends(require_admin)
+    user: dict = Depends(require_permission("permissions"))
 ):
     """Get list of all available system pages."""
     return {
@@ -772,7 +808,7 @@ async def get_available_pages(
 
 @app.get("/api/permissions/users", tags=["Permissions"])
 async def get_users_permissions(
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("permissions")),
     db: Session = Depends(get_db)
 ):
     """Get all officers with their permissions."""
@@ -800,10 +836,10 @@ class PermissionUpdate(BaseModel):
 async def update_user_permissions(
     user_id: int,
     data: PermissionUpdate,
-    admin: dict = Depends(require_admin),
+    current_user: dict = Depends(require_permission("permissions")),
     db: Session = Depends(get_db)
 ):
-    """Update a user's page permissions (admin only)."""
+    """Update a user's page permissions."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(
@@ -912,7 +948,7 @@ async def get_my_permissions(
     }
 
 
-# ==================== Auth Logs (Admin Only) ====================
+# ==================== Auth Logs ====================
 
 @app.get("/api/logs/auth", response_model=AuthLogList, tags=["Logs"])
 async def get_auth_logs(
@@ -922,10 +958,10 @@ async def get_auth_logs(
     action: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("auth_logs")),
     db: Session = Depends(get_db)
 ):
-    """Get authentication logs with pagination and advanced filters (admin only)."""
+    """Get authentication logs with pagination and advanced filters."""
     query = db.query(AuthLog).join(User)
     
     # Apply filters
@@ -974,7 +1010,7 @@ async def get_auth_logs(
     return AuthLogList(logs=log_responses, total=total, page=page, per_page=per_page)
 
 
-# ==================== Scan Logs (Admin Only) ====================
+# ==================== Scan Logs ====================
 
 @app.get("/api/logs/scans", response_model=ScanLogList, tags=["Logs"])
 async def get_scan_logs(
@@ -984,10 +1020,10 @@ async def get_scan_logs(
     match_only: bool = True,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("scan_logs")),
     db: Session = Depends(get_db)
 ):
-    """Get scan logs with pagination and advanced filters (admin only). By default shows only matches."""
+    """Get scan logs with pagination and advanced filters. By default shows only matches."""
     query = db.query(ScanLog).join(User, ScanLog.officer_id == User.id)
     
     # Apply filters
@@ -1055,7 +1091,7 @@ async def get_scan_logs(
 
 @app.get("/api/officers", tags=["Logs"])
 async def get_officers_list(
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_auth),
     db: Session = Depends(get_db)
 ):
     """Get list of officers for filter dropdowns."""
@@ -1063,14 +1099,14 @@ async def get_officers_list(
     return [{"id": o.id, "username": o.username, "full_name": o.full_name} for o in officers]
 
 
-# ==================== Dashboard Statistics (Admin Only) ====================
+# ==================== Dashboard Statistics ====================
 
 @app.get("/api/dashboard/stats", response_model=DashboardStats, tags=["Dashboard"])
 async def get_dashboard_stats(
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("dashboard")),
     db: Session = Depends(get_db)
 ):
-    """Get dashboard statistics (admin only) with advanced analytics."""
+    """Get dashboard statistics with advanced analytics."""
     now = datetime.now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = today_start - timedelta(days=7)
@@ -1173,7 +1209,7 @@ async def get_dashboard_stats(
     )
 
 
-# ==================== Export to CSV (Admin Only) ====================
+# ==================== Export to CSV ====================
 
 @app.get("/api/export/auth-logs", tags=["Export"])
 async def export_auth_logs(
@@ -1181,7 +1217,7 @@ async def export_auth_logs(
     date_to: Optional[str] = None,
     user_id: Optional[int] = None,
     action: Optional[str] = None,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("auth_logs")),
     db: Session = Depends(get_db)
 ):
     """Export authentication logs to CSV."""
@@ -1238,7 +1274,7 @@ async def export_scan_logs(
     date_to: Optional[str] = None,
     officer_id: Optional[int] = None,
     match_only: bool = True,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("scan_logs")),
     db: Session = Depends(get_db)
 ):
     """Export scan logs to CSV."""
@@ -1293,7 +1329,7 @@ async def export_scan_logs(
 
 @app.get("/api/export/visitors", tags=["Export"])
 async def export_visitors(
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("visitors")),
     db: Session = Depends(get_db)
 ):
     """Export visitors list to CSV."""
@@ -1321,17 +1357,17 @@ async def export_visitors(
     )
 
 
-# ==================== Notifications (Admin Only) ====================
+# ==================== Notifications ====================
 
 @app.get("/api/notifications", response_model=NotificationList, tags=["Notifications"])
 async def get_notifications(
     page: int = 1,
     per_page: int = 20,
     unread_only: bool = False,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("notifications")),
     db: Session = Depends(get_db)
 ):
-    """Get notifications for admin."""
+    """Get notifications."""
     query = db.query(Notification)
     
     if unread_only:
@@ -1364,7 +1400,7 @@ async def get_notifications(
 @app.patch("/api/notifications/{notification_id}/read", tags=["Notifications"])
 async def mark_notification_read(
     notification_id: int,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("notifications")),
     db: Session = Depends(get_db)
 ):
     """Mark a notification as read."""
@@ -1379,7 +1415,7 @@ async def mark_notification_read(
 
 @app.patch("/api/notifications/read-all", tags=["Notifications"])
 async def mark_all_notifications_read(
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("notifications")),
     db: Session = Depends(get_db)
 ):
     """Mark all notifications as read."""
@@ -1411,10 +1447,10 @@ async def register_visitor(
     passport_number: str = Form(...),
     visa_status: str = Form(...),
     photo: UploadFile = File(...),
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("visitors")),
     db: Session = Depends(get_db)
 ):
-    """Register a new visitor with their photo (admin only)."""
+    """Register a new visitor with their photo."""
     try:
         # Check if passport already exists
         existing = db.query(Visitor).filter(Visitor.passport_number == passport_number).first()
@@ -1497,10 +1533,10 @@ async def register_visitor(
 
 @app.get("/api/visitors", response_model=VisitorList, tags=["Visitors"])
 async def list_visitors(
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("visitors")),
     db: Session = Depends(get_db)
 ):
-    """Get all registered visitors (admin only)."""
+    """Get all registered visitors."""
     try:
         visitors = db.query(Visitor).order_by(Visitor.created_at.desc()).all()
         return VisitorList(visitors=visitors, total=len(visitors))
@@ -1515,10 +1551,10 @@ async def list_visitors(
 @app.get("/api/visitors/{visitor_id}", response_model=VisitorResponse, tags=["Visitors"])
 async def get_visitor(
     visitor_id: int,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("visitors")),
     db: Session = Depends(get_db)
 ):
-    """Get a specific visitor by ID (admin only)."""
+    """Get a specific visitor by ID."""
     visitor = db.query(Visitor).filter(Visitor.id == visitor_id).first()
     if not visitor:
         raise HTTPException(
@@ -1531,10 +1567,10 @@ async def get_visitor(
 @app.delete("/api/visitors/{visitor_id}", response_model=MessageResponse, tags=["Visitors"])
 async def delete_visitor(
     visitor_id: int,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("visitors")),
     db: Session = Depends(get_db)
 ):
-    """Delete a visitor by ID (admin only)."""
+    """Delete a visitor by ID."""
     visitor = db.query(Visitor).filter(Visitor.id == visitor_id).first()
     if not visitor:
         raise HTTPException(
@@ -1717,10 +1753,10 @@ async def verify_face(
 
 @app.get("/api/stats", tags=["Statistics"])
 async def get_statistics(
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_permission("dashboard")),
     db: Session = Depends(get_db)
 ):
-    """Get system statistics (admin only)."""
+    """Get system statistics."""
     total_visitors = db.query(Visitor).count()
     total_users = db.query(User).count()
     total_scans = db.query(ScanLog).count()
