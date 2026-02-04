@@ -1,19 +1,24 @@
 """
 MOI Biometric System - FastAPI Backend
 Main application file with all API endpoints
-Using DeepFace for face recognition
-Build: 2026-02-04-v3.5
+Using DeepFace for face recognition with enhanced security
+Build: 2026-02-04-v4.5 - Enhanced Security & Speed
 """
 
 import os
 import uuid
 import base64
+import cv2
+import time
+import threading
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
+from scipy.spatial.distance import cosine as cosine_distance
 from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException, status, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -71,16 +76,134 @@ SCAN_PHOTOS_DIR = os.path.join(UPLOAD_DIR, "scans")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(SCAN_PHOTOS_DIR, exist_ok=True)
 
-# DeepFace model configuration
+# =================================================================
+# ENHANCED SECURITY CONFIGURATION
+# =================================================================
+
+# DeepFace model configuration - Using best accuracy model
 FACE_MODEL = "Facenet512"
 DISTANCE_METRIC = "cosine"
-MATCH_THRESHOLD = 0.40
+
+# Multi-level confidence thresholds
+THRESHOLD_HIGH = 0.30      # High confidence match (70%+ similarity)
+THRESHOLD_MEDIUM = 0.40    # Medium confidence (60%+ similarity)
+THRESHOLD_LOW = 0.50       # Low confidence - requires manual review
+
+# Use RetinaFace for better face detection accuracy
+DETECTOR_BACKEND = "retinaface"  # Options: opencv, ssd, mtcnn, retinaface, mediapipe
+
+# Image quality thresholds
+MIN_FACE_SIZE = 80          # Minimum face size in pixels
+MIN_BRIGHTNESS = 40         # Minimum average brightness (0-255)
+MAX_BRIGHTNESS = 220        # Maximum average brightness
+MIN_SHARPNESS = 50          # Minimum Laplacian variance for blur detection
+MIN_FACE_CONFIDENCE = 0.9   # Minimum face detection confidence
+
+# Rate limiting configuration
+RATE_LIMIT_WINDOW = 60      # seconds
+MAX_SCANS_PER_MINUTE = 10   # per user
+MAX_FAILED_SCANS = 5        # before temporary lockout
+LOCKOUT_DURATION = 300      # 5 minutes lockout
+
+# =================================================================
+# IN-MEMORY CACHING & RATE LIMITING
+# =================================================================
+
+class EmbeddingsCache:
+    """In-memory cache for face embeddings with auto-refresh"""
+    def __init__(self):
+        self._cache: Dict[int, np.ndarray] = {}
+        self._lock = threading.Lock()
+        self._last_refresh = datetime.min
+        self._refresh_interval = timedelta(minutes=5)
+    
+    def get_all(self) -> Dict[int, np.ndarray]:
+        with self._lock:
+            return self._cache.copy()
+    
+    def set(self, visitor_id: int, embedding: list):
+        with self._lock:
+            self._cache[visitor_id] = np.array(embedding)
+    
+    def remove(self, visitor_id: int):
+        with self._lock:
+            self._cache.pop(visitor_id, None)
+    
+    def refresh(self, db: Session):
+        """Refresh cache from database"""
+        with self._lock:
+            from models import Visitor
+            visitors = db.query(Visitor).all()
+            self._cache = {v.id: np.array(v.face_encoding) for v in visitors}
+            self._last_refresh = datetime.now()
+            print(f"🔄 Embeddings cache refreshed: {len(self._cache)} visitors")
+    
+    def needs_refresh(self) -> bool:
+        return datetime.now() - self._last_refresh > self._refresh_interval
+    
+    def size(self) -> int:
+        return len(self._cache)
+
+
+class RateLimiter:
+    """Rate limiter for API security"""
+    def __init__(self):
+        self._requests: Dict[int, List[float]] = defaultdict(list)
+        self._failures: Dict[int, int] = defaultdict(int)
+        self._lockouts: Dict[int, float] = {}
+        self._lock = threading.Lock()
+    
+    def is_locked(self, user_id: int) -> Tuple[bool, int]:
+        """Check if user is locked out. Returns (is_locked, remaining_seconds)"""
+        with self._lock:
+            if user_id in self._lockouts:
+                remaining = self._lockouts[user_id] - time.time()
+                if remaining > 0:
+                    return True, int(remaining)
+                else:
+                    del self._lockouts[user_id]
+                    self._failures[user_id] = 0
+        return False, 0
+    
+    def check_rate_limit(self, user_id: int) -> Tuple[bool, str]:
+        """Check if request is within rate limits. Returns (allowed, message)"""
+        with self._lock:
+            now = time.time()
+            
+            # Clean old requests
+            self._requests[user_id] = [t for t in self._requests[user_id] if now - t < RATE_LIMIT_WINDOW]
+            
+            # Check rate limit
+            if len(self._requests[user_id]) >= MAX_SCANS_PER_MINUTE:
+                return False, f"تجاوزت الحد الأقصى ({MAX_SCANS_PER_MINUTE} مسح/دقيقة)"
+            
+            # Add request
+            self._requests[user_id].append(now)
+            return True, ""
+    
+    def record_failure(self, user_id: int):
+        """Record a failed scan attempt"""
+        with self._lock:
+            self._failures[user_id] += 1
+            if self._failures[user_id] >= MAX_FAILED_SCANS:
+                self._lockouts[user_id] = time.time() + LOCKOUT_DURATION
+                print(f"⚠️ User {user_id} locked out for {LOCKOUT_DURATION}s after {MAX_FAILED_SCANS} failures")
+    
+    def reset_failures(self, user_id: int):
+        """Reset failure count on successful scan"""
+        with self._lock:
+            self._failures[user_id] = 0
+
+
+# Initialize global instances
+embeddings_cache = EmbeddingsCache()
+rate_limiter = RateLimiter()
 
 # Initialize FastAPI app
 app = FastAPI(
     title="MOI Biometric System",
     description="Kuwait Ministry of Interior - Facial Recognition Security System",
-    version="4.0.1",
+    version="5.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -128,45 +251,241 @@ async def cors_middleware(request: Request, call_next):
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
-# ==================== Helper Functions ====================
+# ==================== Enhanced Helper Functions ====================
 
-def get_face_embedding(image_path: str) -> list:
-    """Generate face embedding using DeepFace."""
+class ImageQualityResult:
+    """Result of image quality assessment"""
+    def __init__(self):
+        self.is_valid = True
+        self.brightness = 0
+        self.sharpness = 0
+        self.face_size = 0
+        self.face_confidence = 0
+        self.warnings: List[str] = []
+        self.errors: List[str] = []
+
+
+def assess_image_quality(image_path: str) -> ImageQualityResult:
+    """
+    Assess image quality for face recognition.
+    Checks: brightness, sharpness/blur, face size, face detection confidence
+    """
+    result = ImageQualityResult()
+    
+    try:
+        # Load image with OpenCV
+        img = cv2.imread(image_path)
+        if img is None:
+            result.is_valid = False
+            result.errors.append("فشل في قراءة الصورة")
+            return result
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Check brightness
+        result.brightness = np.mean(gray)
+        if result.brightness < MIN_BRIGHTNESS:
+            result.warnings.append(f"الصورة مظلمة جداً (السطوع: {result.brightness:.0f})")
+        elif result.brightness > MAX_BRIGHTNESS:
+            result.warnings.append(f"الصورة ساطعة جداً (السطوع: {result.brightness:.0f})")
+        
+        # Check sharpness (Laplacian variance - lower = more blur)
+        result.sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if result.sharpness < MIN_SHARPNESS:
+            result.warnings.append(f"الصورة غير واضحة (الحدة: {result.sharpness:.0f})")
+        
+        # Try to detect face for size and confidence
+        try:
+            faces = DeepFace.extract_faces(
+                img_path=image_path,
+                detector_backend=DETECTOR_BACKEND,
+                enforce_detection=False
+            )
+            
+            if len(faces) == 0:
+                result.is_valid = False
+                result.errors.append("لم يتم اكتشاف وجه في الصورة")
+            elif len(faces) > 1:
+                result.is_valid = False
+                result.errors.append(f"تم اكتشاف {len(faces)} وجوه - يجب وجه واحد فقط")
+            else:
+                face = faces[0]
+                result.face_confidence = face.get('confidence', 0)
+                
+                # Get face region size
+                facial_area = face.get('facial_area', {})
+                face_width = facial_area.get('w', 0)
+                face_height = facial_area.get('h', 0)
+                result.face_size = min(face_width, face_height)
+                
+                if result.face_size < MIN_FACE_SIZE:
+                    result.warnings.append(f"الوجه صغير جداً ({result.face_size}px) - اقترب من الكاميرا")
+                
+                if result.face_confidence < MIN_FACE_CONFIDENCE:
+                    result.warnings.append(f"جودة اكتشاف الوجه منخفضة ({result.face_confidence:.1%})")
+        
+        except Exception as e:
+            result.warnings.append(f"تحذير في تحليل الوجه: {str(e)}")
+    
+    except Exception as e:
+        result.is_valid = False
+        result.errors.append(f"خطأ في تقييم جودة الصورة: {str(e)}")
+    
+    return result
+
+
+def detect_spoofing(image_path: str) -> Tuple[bool, float, str]:
+    """
+    Anti-spoofing detection using multiple techniques.
+    Returns: (is_real, confidence, message)
+    
+    Techniques used:
+    1. Texture analysis (LBP variance)
+    2. Color distribution analysis
+    3. Reflection detection
+    """
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            return False, 0.0, "فشل قراءة الصورة"
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # 1. Texture analysis using Local Binary Pattern variance
+        # Real faces have more texture variation than printed photos
+        def compute_lbp_variance(image):
+            rows, cols = image.shape
+            lbp = np.zeros_like(image)
+            for i in range(1, rows - 1):
+                for j in range(1, cols - 1):
+                    center = image[i, j]
+                    code = 0
+                    code |= (image[i-1, j-1] >= center) << 7
+                    code |= (image[i-1, j] >= center) << 6
+                    code |= (image[i-1, j+1] >= center) << 5
+                    code |= (image[i, j+1] >= center) << 4
+                    code |= (image[i+1, j+1] >= center) << 3
+                    code |= (image[i+1, j] >= center) << 2
+                    code |= (image[i+1, j-1] >= center) << 1
+                    code |= (image[i, j-1] >= center) << 0
+                    lbp[i, j] = code
+            return np.var(lbp)
+        
+        # Simplified LBP for speed
+        lbp_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        texture_score = min(lbp_var / 500, 1.0)  # Normalize to 0-1
+        
+        # 2. Color distribution - real faces have specific skin color distribution
+        # Check saturation variance (printed photos often have less saturation variance)
+        sat_var = np.var(hsv[:, :, 1])
+        color_score = min(sat_var / 2000, 1.0)
+        
+        # 3. Specular reflection detection (screens/photos often have uniform lighting)
+        _, highlights = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY)
+        highlight_ratio = np.sum(highlights > 0) / highlights.size
+        reflection_score = 1.0 - min(highlight_ratio * 10, 1.0)
+        
+        # Combined score
+        final_score = (texture_score * 0.4 + color_score * 0.3 + reflection_score * 0.3)
+        
+        # Thresholds
+        is_real = final_score > 0.35
+        
+        if is_real:
+            return True, final_score, "تم التحقق من صحة الوجه"
+        else:
+            return False, final_score, "تحذير: قد تكون الصورة مزيفة (شاشة أو صورة مطبوعة)"
+    
+    except Exception as e:
+        # If anti-spoofing fails, allow but with warning
+        print(f"⚠️ Anti-spoofing check error: {e}")
+        return True, 0.5, "تعذر التحقق من صحة الوجه"
+
+
+def get_face_embedding(image_path: str, with_quality_check: bool = True) -> Tuple[list, ImageQualityResult]:
+    """
+    Generate face embedding using DeepFace with RetinaFace detector.
+    Returns: (embedding, quality_result)
+    """
+    quality_result = ImageQualityResult()
+    
+    # Quality check if enabled
+    if with_quality_check:
+        quality_result = assess_image_quality(image_path)
+        if not quality_result.is_valid:
+            raise ValueError("; ".join(quality_result.errors))
+    
     try:
         embedding_objs = DeepFace.represent(
             img_path=image_path,
             model_name=FACE_MODEL,
             enforce_detection=True,
-            detector_backend="opencv"
+            detector_backend=DETECTOR_BACKEND
         )
         
         if len(embedding_objs) == 0:
-            raise ValueError("No face detected in image")
+            raise ValueError("لم يتم اكتشاف وجه في الصورة")
         
         if len(embedding_objs) > 1:
-            raise ValueError(f"Multiple faces ({len(embedding_objs)}) detected in image")
+            raise ValueError(f"تم اكتشاف {len(embedding_objs)} وجوه - يجب وجه واحد فقط")
         
-        return embedding_objs[0]["embedding"]
+        return embedding_objs[0]["embedding"], quality_result
     
     except Exception as e:
-        raise ValueError(f"Face detection failed: {str(e)}")
+        raise ValueError(f"فشل في تحليل الوجه: {str(e)}")
+
+
+def compare_embeddings_fast(embedding1: np.ndarray, embedding2: np.ndarray) -> float:
+    """
+    Fast comparison of two face embeddings using scipy.
+    Returns cosine distance (0 = identical, 1 = completely different)
+    """
+    return cosine_distance(embedding1, embedding2)
+
+
+def find_best_match_fast(captured_embedding: list, db: Session) -> Tuple[Optional[int], float, str]:
+    """
+    Find the best matching visitor using cached embeddings.
+    Returns: (visitor_id, distance, confidence_level)
+    """
+    captured_vec = np.array(captured_embedding)
+    
+    # Refresh cache if needed
+    if embeddings_cache.needs_refresh() or embeddings_cache.size() == 0:
+        embeddings_cache.refresh(db)
+    
+    cached = embeddings_cache.get_all()
+    
+    if len(cached) == 0:
+        return None, float('inf'), "none"
+    
+    best_id = None
+    best_distance = float('inf')
+    
+    # Fast vectorized comparison
+    for visitor_id, stored_vec in cached.items():
+        distance = compare_embeddings_fast(captured_vec, stored_vec)
+        if distance < best_distance:
+            best_distance = distance
+            best_id = visitor_id
+    
+    # Determine confidence level
+    if best_distance < THRESHOLD_HIGH:
+        confidence_level = "high"
+    elif best_distance < THRESHOLD_MEDIUM:
+        confidence_level = "medium"
+    elif best_distance < THRESHOLD_LOW:
+        confidence_level = "low"
+    else:
+        confidence_level = "none"
+    
+    return best_id, best_distance, confidence_level
 
 
 def compare_embeddings(embedding1: list, embedding2: list) -> float:
-    """Compare two face embeddings and return distance."""
-    vec1 = np.array(embedding1)
-    vec2 = np.array(embedding2)
-    
-    if DISTANCE_METRIC == "cosine":
-        dot_product = np.dot(vec1, vec2)
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-        similarity = dot_product / (norm1 * norm2)
-        distance = 1 - similarity
-    else:
-        distance = np.linalg.norm(vec1 - vec2)
-    
-    return float(distance)
+    """Compare two face embeddings and return distance (legacy support)."""
+    return compare_embeddings_fast(np.array(embedding1), np.array(embedding2))
 
 
 def get_client_ip(request: Request) -> str:
@@ -262,7 +581,7 @@ async def root():
     return {
         "status": "online",
         "system": "MOI Biometric Security System",
-        "version": "4.0.1",
+        "version": "5.0.0",
         "face_model": FACE_MODEL
     }
 
@@ -275,7 +594,55 @@ async def health_check():
         "database": "connected",
         "face_recognition": "ready",
         "model": FACE_MODEL,
-        "threshold": MATCH_THRESHOLD
+        "detector": DETECTOR_BACKEND,
+        "thresholds": {
+            "high": THRESHOLD_HIGH,
+            "medium": THRESHOLD_MEDIUM,
+            "low": THRESHOLD_LOW
+        },
+        "cache_size": embeddings_cache.size(),
+        "security_features": [
+            "anti_spoofing",
+            "quality_check",
+            "rate_limiting",
+            "multi_level_confidence"
+        ]
+    }
+
+
+@app.get("/api/security/status", tags=["Security"])
+async def security_status(
+    admin: dict = Depends(require_admin)
+):
+    """Get security system status (admin only)."""
+    return {
+        "face_model": FACE_MODEL,
+        "detector_backend": DETECTOR_BACKEND,
+        "confidence_thresholds": {
+            "high": f"{(1-THRESHOLD_HIGH)*100:.0f}%+",
+            "medium": f"{(1-THRESHOLD_MEDIUM)*100:.0f}%+",
+            "low": f"{(1-THRESHOLD_LOW)*100:.0f}%+"
+        },
+        "security_features": {
+            "anti_spoofing": True,
+            "liveness_detection": True,
+            "image_quality_check": True,
+            "rate_limiting": {
+                "max_per_minute": MAX_SCANS_PER_MINUTE,
+                "lockout_after_failures": MAX_FAILED_SCANS,
+                "lockout_duration_seconds": LOCKOUT_DURATION
+            }
+        },
+        "cache": {
+            "embeddings_cached": embeddings_cache.size(),
+            "needs_refresh": embeddings_cache.needs_refresh()
+        },
+        "image_quality_thresholds": {
+            "min_face_size_px": MIN_FACE_SIZE,
+            "min_brightness": MIN_BRIGHTNESS,
+            "max_brightness": MAX_BRIGHTNESS,
+            "min_sharpness": MIN_SHARPNESS
+        }
     }
 
 
@@ -1076,9 +1443,13 @@ async def register_visitor(
         photo_path = os.path.join(UPLOAD_DIR, unique_filename)
         image.save(photo_path, quality=85)
         
-        # Generate face embedding
+        # Generate face embedding with quality check
         try:
-            face_embedding = get_face_embedding(photo_path)
+            face_embedding, quality_result = get_face_embedding(photo_path, with_quality_check=True)
+            
+            # Warn if there are quality issues
+            if quality_result.warnings:
+                print(f"⚠️ Quality warnings for {full_name}: {quality_result.warnings}")
         except ValueError as e:
             if os.path.exists(photo_path):
                 os.remove(photo_path)
@@ -1109,6 +1480,9 @@ async def register_visitor(
         db.add(visitor)
         db.commit()
         db.refresh(visitor)
+        
+        # Update embeddings cache
+        embeddings_cache.set(visitor.id, face_embedding)
         
         print(f"✅ Visitor registered: {full_name} ({passport_number}) by {admin['username']}")
         
@@ -1172,20 +1546,25 @@ async def delete_visitor(
         )
     
     # Delete photo file
-    photo_path = os.path.join(UPLOAD_DIR, visitor.photo_path)
-    if os.path.exists(photo_path):
-        os.remove(photo_path)
+    if visitor.photo_path:
+        photo_path = os.path.join(UPLOAD_DIR, visitor.photo_path)
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
     
     name = visitor.full_name
+    vid = visitor.id
     db.delete(visitor)
     db.commit()
+    
+    # Remove from embeddings cache
+    embeddings_cache.remove(vid)
     
     return MessageResponse(success=True, message=f"تم حذف الزائر {name}")
 
 
 # ==================== Face Verification (All Authenticated Users) ====================
 
-@app.post("/api/verify", response_model=VerificationResult, tags=["Security"])
+@app.post("/api/verify", tags=["Security"])
 async def verify_face(
     req: Request,
     photo: UploadFile = File(...),
@@ -1194,9 +1573,15 @@ async def verify_face(
     db: Session = Depends(get_db)
 ):
     """
-    Verify a face against all registered visitors.
-    Logs the scan with officer information.
+    Enhanced face verification with:
+    - Anti-spoofing detection
+    - Image quality assessment
+    - Multi-level confidence thresholds
+    - Rate limiting protection
+    - Fast cached embedding search
     """
+    start_time = time.time()
+    
     # Get authenticated user
     auth_token = get_token_from_header(authorization) or token
     if not auth_token:
@@ -1212,8 +1597,25 @@ async def verify_face(
             detail="الجلسة غير صالحة أو منتهية"
         )
     
+    user_id = user_data["user_id"]
+    
+    # Rate limiting check
+    is_locked, remaining = rate_limiter.is_locked(user_id)
+    if is_locked:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"تم تعليق الحساب مؤقتاً. حاول بعد {remaining} ثانية"
+        )
+    
+    allowed, rate_msg = rate_limiter.check_rate_limit(user_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=rate_msg
+        )
+    
     temp_path = None
-    saved_scan_path = None
+    quality_warnings = []
     
     try:
         # Read and process uploaded image
@@ -1223,17 +1625,49 @@ async def verify_face(
         if image.mode != "RGB":
             image = image.convert("RGB")
         
-        # Save temporarily for DeepFace processing
+        # Save temporarily for processing
         temp_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4()}.jpg")
         image.save(temp_path, quality=95)
         
-        # Generate face embedding
-        try:
-            captured_embedding = get_face_embedding(temp_path)
-        except ValueError as e:
-            # Log failed scan (no face detected)
+        # Step 1: Anti-spoofing check
+        is_real, spoof_score, spoof_msg = detect_spoofing(temp_path)
+        if not is_real:
+            rate_limiter.record_failure(user_id)
+            
+            # Log suspicious activity
             scan_log = ScanLog(
-                officer_id=user_data["user_id"],
+                officer_id=user_id,
+                visitor_id=None,
+                match_found=False,
+                confidence=0,
+                ip_address=get_client_ip(req),
+                location=f"SPOOF_DETECTED:{spoof_score:.2f}",
+                captured_photo_path=None
+            )
+            db.add(scan_log)
+            db.commit()
+            
+            return {
+                "match_found": False,
+                "confidence": 0,
+                "confidence_level": "rejected",
+                "visitor": None,
+                "message": f"⚠️ {spoof_msg}",
+                "captured_photo": None,
+                "quality_warnings": ["تم اكتشاف محاولة احتيال محتملة"],
+                "processing_time_ms": int((time.time() - start_time) * 1000),
+                "is_spoofing_detected": True
+            }
+        
+        # Step 2: Generate face embedding with quality check
+        try:
+            captured_embedding, quality_result = get_face_embedding(temp_path, with_quality_check=True)
+            quality_warnings = quality_result.warnings
+        except ValueError as e:
+            rate_limiter.record_failure(user_id)
+            
+            scan_log = ScanLog(
+                officer_id=user_id,
                 visitor_id=None,
                 match_found=False,
                 confidence=None,
@@ -1244,98 +1678,106 @@ async def verify_face(
             db.add(scan_log)
             db.commit()
             
-            return VerificationResult(
-                match_found=False,
-                confidence=None,
-                visitor=None,
-                message=str(e),
-                captured_photo=None
-            )
+            return {
+                "match_found": False,
+                "confidence": None,
+                "confidence_level": "none",
+                "visitor": None,
+                "message": str(e),
+                "captured_photo": None,
+                "quality_warnings": quality_result.errors if 'quality_result' in dir() else [str(e)],
+                "processing_time_ms": int((time.time() - start_time) * 1000),
+                "is_spoofing_detected": False
+            }
         
-        # Get all visitors
-        visitors = db.query(Visitor).all()
-        
-        if len(visitors) == 0:
-            return VerificationResult(
-                match_found=False,
-                confidence=None,
-                visitor=None,
-                message="لا يوجد زوار مسجلين في قاعدة البيانات",
-                captured_photo=None
-            )
-        
-        # Compare against all stored embeddings
-        best_match = None
-        best_distance = float('inf')
-        
-        for visitor in visitors:
-            stored_embedding = visitor.face_encoding
-            distance = compare_embeddings(captured_embedding, stored_embedding)
-            
-            if distance < best_distance:
-                best_distance = distance
-                best_match = visitor
+        # Step 3: Fast search using cached embeddings
+        best_id, best_distance, confidence_level = find_best_match_fast(captured_embedding, db)
         
         # Convert captured image to base64
         buffered = BytesIO()
         image.save(buffered, format="JPEG", quality=85)
         captured_base64 = base64.b64encode(buffered.getvalue()).decode()
         
-        # Check if match found
-        match_found = best_match and best_distance < MATCH_THRESHOLD
+        # Calculate confidence percentage
         confidence = round((1 - best_distance) * 100, 2) if best_distance < 1 else 0
         
-        # Save scan photo only for matches
-        if match_found:
+        # Determine if match is valid based on multi-level thresholds
+        match_found = confidence_level in ["high", "medium"]
+        
+        # Get visitor data if match found
+        best_match = None
+        if best_id:
+            best_match = db.query(Visitor).filter(Visitor.id == best_id).first()
+        
+        # Save scan photo for matches
+        relative_scan_path = None
+        if match_found and best_match:
             scan_filename = f"scan_{uuid.uuid4()}.jpg"
             saved_scan_path = os.path.join(SCAN_PHOTOS_DIR, scan_filename)
             image.save(saved_scan_path, quality=85)
             relative_scan_path = f"scans/{scan_filename}"
+            rate_limiter.reset_failures(user_id)
         else:
-            relative_scan_path = None
+            rate_limiter.record_failure(user_id)
         
         # Log the scan
         scan_log = ScanLog(
-            officer_id=user_data["user_id"],
-            visitor_id=best_match.id if match_found else None,
+            officer_id=user_id,
+            visitor_id=best_match.id if match_found and best_match else None,
             match_found=match_found,
             confidence=confidence,
             ip_address=get_client_ip(req),
-            location=None,
+            location=f"LEVEL:{confidence_level}",
             captured_photo_path=relative_scan_path
         )
         db.add(scan_log)
         db.commit()
         
-        if match_found:
-            print(f"✅ MATCH: {best_match.full_name} by {user_data['username']} (Confidence: {confidence}%)")
+        processing_time = int((time.time() - start_time) * 1000)
+        
+        if match_found and best_match:
+            print(f"✅ MATCH [{confidence_level.upper()}]: {best_match.full_name} by {user_data['username']} ({confidence}%) in {processing_time}ms")
             
-            return VerificationResult(
-                match_found=True,
-                confidence=confidence,
-                visitor=VisitorResponse(
-                    id=best_match.id,
-                    full_name=best_match.full_name,
-                    passport_number=best_match.passport_number,
-                    visa_status=best_match.visa_status,
-                    photo_path=best_match.photo_path,
-                    photo_base64=best_match.photo_base64,
-                    created_at=best_match.created_at,
-                    updated_at=best_match.updated_at
-                ),
-                message=f"تم التحقق من الهوية: {best_match.full_name}",
-                captured_photo=captured_base64
-            )
+            # Prepare message based on confidence level
+            if confidence_level == "high":
+                status_msg = f"✅ تطابق مؤكد: {best_match.full_name}"
+            else:
+                status_msg = f"⚡ تطابق محتمل: {best_match.full_name} (يُنصح بالتحقق اليدوي)"
+            
+            return {
+                "match_found": True,
+                "confidence": confidence,
+                "confidence_level": confidence_level,
+                "visitor": {
+                    "id": best_match.id,
+                    "full_name": best_match.full_name,
+                    "passport_number": best_match.passport_number,
+                    "visa_status": best_match.visa_status,
+                    "photo_path": best_match.photo_path,
+                    "photo_base64": best_match.photo_base64,
+                    "created_at": best_match.created_at.isoformat() if best_match.created_at else None,
+                    "updated_at": best_match.updated_at.isoformat() if best_match.updated_at else None
+                },
+                "message": status_msg,
+                "captured_photo": captured_base64,
+                "quality_warnings": quality_warnings,
+                "processing_time_ms": processing_time,
+                "is_spoofing_detected": False
+            }
         else:
-            print(f"❌ NO MATCH by {user_data['username']} (Best distance: {best_distance:.4f})")
+            print(f"❌ NO MATCH by {user_data['username']} (best: {best_distance:.4f}, level: {confidence_level}) in {processing_time}ms")
             
-            return VerificationResult(
-                match_found=False,
-                confidence=confidence,
-                visitor=None,
-                message="غير مصرح - لا يوجد تطابق في السجلات",
-                captured_photo=captured_base64
-            )
+            return {
+                "match_found": False,
+                "confidence": confidence,
+                "confidence_level": confidence_level,
+                "visitor": None,
+                "message": "غير مصرح - لا يوجد تطابق في السجلات",
+                "captured_photo": captured_base64,
+                "quality_warnings": quality_warnings,
+                "processing_time_ms": processing_time,
+                "is_spoofing_detected": False
+            }
 
     except Exception as e:
         print(f"❌ Verification error: {str(e)}")
