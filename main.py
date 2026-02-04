@@ -74,14 +74,13 @@ MATCH_THRESHOLD = 0.40
 app = FastAPI(
     title="MOI Biometric System",
     description="Kuwait Ministry of Interior - Facial Recognition Security System",
-    version="3.6.0",
+    version="3.7.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
 
-# CORS Configuration - MUST be added BEFORE mounting static files
-# Using official CORSMiddleware with explicit origins
-origins = [
+# CORS origins
+CORS_ORIGINS = [
     "https://moi-biometric-frontend.vercel.app",
     "https://moi-biometric-frontend-git-main-omars-projects-5731842e.vercel.app",
     "http://localhost:5173",
@@ -89,17 +88,37 @@ origins = [
     "http://localhost:3000",
 ]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=3600,
-)
+# Custom middleware to handle CORS for ALL responses including errors
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    # Handle preflight
+    if request.method == "OPTIONS":
+        response = JSONResponse(content={}, status_code=200)
+    else:
+        try:
+            response = await call_next(request)
+        except Exception as e:
+            response = JSONResponse(
+                content={"detail": str(e)},
+                status_code=500
+            )
+    
+    # Add CORS headers to ALL responses
+    origin = request.headers.get("origin", "")
+    if origin in CORS_ORIGINS or not origin:
+        response.headers["Access-Control-Allow-Origin"] = origin or "*"
+    else:
+        response.headers["Access-Control-Allow-Origin"] = CORS_ORIGINS[0]
+    
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, Origin, X-Requested-With"
+    response.headers["Access-Control-Expose-Headers"] = "*"
+    response.headers["Access-Control-Max-Age"] = "3600"
+    
+    return response
 
-# Mount uploads directory AFTER CORS middleware
+# Mount uploads directory
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
@@ -237,7 +256,7 @@ async def root():
     return {
         "status": "online",
         "system": "MOI Biometric Security System",
-        "version": "3.6.0",
+        "version": "3.7.0",
         "face_model": FACE_MODEL
     }
 
@@ -763,8 +782,15 @@ async def list_visitors(
     db: Session = Depends(get_db)
 ):
     """Get all registered visitors (admin only)."""
-    visitors = db.query(Visitor).order_by(Visitor.created_at.desc()).all()
-    return VisitorList(visitors=visitors, total=len(visitors))
+    try:
+        visitors = db.query(Visitor).order_by(Visitor.created_at.desc()).all()
+        return VisitorList(visitors=visitors, total=len(visitors))
+    except Exception as e:
+        print(f"Error listing visitors: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"خطأ في جلب الزوار: {str(e)}"
+        )
 
 
 @app.get("/api/visitors/{visitor_id}", response_model=VisitorResponse, tags=["Visitors"])
