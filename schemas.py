@@ -118,8 +118,8 @@ class ScanLogList(BaseModel):
 class VisitorBase(BaseModel):
     """Base schema for visitor data"""
     full_name: str = Field(..., min_length=2, max_length=255, description="Visitor's full name")
-    passport_number: str = Field(..., min_length=5, max_length=50, description="Passport number")
-    visa_status: str = Field(..., min_length=2, max_length=100, description="Visa status")
+    passport_number: str = Field(..., min_length=1, max_length=50, description="Passport number")
+    visa_status: str = Field(..., min_length=1, max_length=100, description="Visa status")
 
 
 class VisitorCreate(VisitorBase):
