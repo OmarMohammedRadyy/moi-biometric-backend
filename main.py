@@ -80,7 +80,7 @@ MATCH_THRESHOLD = 0.40
 app = FastAPI(
     title="MOI Biometric System",
     description="Kuwait Ministry of Interior - Facial Recognition Security System",
-    version="4.0.0",
+    version="4.0.1",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -262,7 +262,7 @@ async def root():
     return {
         "status": "online",
         "system": "MOI Biometric Security System",
-        "version": "4.0.0",
+        "version": "4.0.1",
         "face_model": FACE_MODEL
     }
 
@@ -310,7 +310,7 @@ async def login(
             title="محاولة دخول من حساب معطل",
             message=f"محاولة تسجيل دخول فاشلة من الحساب المعطل: {user.full_name} (@{user.username})",
             user_id=user.id,
-            metadata={
+            extra_data={
                 "ip_address": get_client_ip(req),
                 "user_agent": req.headers.get("User-Agent", "")[:200]
             }
@@ -503,7 +503,7 @@ async def toggle_user_status(
         title=f"تم {'تعطيل' if not user.is_active else 'تفعيل'} حساب",
         message=f"تم {'تعطيل' if not user.is_active else 'تفعيل'} حساب العسكري {user.full_name} (@{user.username}) بواسطة {admin['full_name']}",
         user_id=user.id,
-        metadata={"admin_id": admin["user_id"], "admin_username": admin["username"]}
+        extra_data={"admin_id": admin["user_id"], "admin_username": admin["username"]}
     )
     db.add(notification)
     db.commit()
@@ -985,7 +985,7 @@ async def get_notifications(
                 timestamp=n.created_at,
                 is_read=n.is_read,
                 user_id=n.user_id,
-                metadata=n.metadata
+                extra_data=n.extra_data
             ) for n in notifications
         ],
         total=total,
@@ -1021,14 +1021,14 @@ async def mark_all_notifications_read(
 
 
 # Helper function to create notification
-def create_notification(db: Session, type: str, title: str, message: str, user_id: int = None, metadata: dict = None):
+def create_notification(db: Session, type: str, title: str, message: str, user_id: int = None, extra_data: dict = None):
     """Create a new notification."""
     notification = Notification(
         type=type,
         title=title,
         message=message,
         user_id=user_id,
-        metadata=metadata
+        extra_data=extra_data
     )
     db.add(notification)
     db.commit()

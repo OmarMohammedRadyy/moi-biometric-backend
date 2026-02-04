@@ -215,7 +215,7 @@ class NotificationResponse(BaseModel):
     timestamp: datetime
     is_read: bool
     user_id: Optional[int] = None
-    metadata: Optional[dict] = None
+    extra_data: Optional[dict] = None
 
     class Config:
         from_attributes = True

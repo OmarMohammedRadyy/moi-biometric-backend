@@ -80,7 +80,7 @@ def run_migrations():
                     title VARCHAR(255) NOT NULL,
                     message TEXT NOT NULL,
                     user_id INTEGER REFERENCES users(id),
-                    metadata JSON,
+                    extra_data JSON,
                     is_read BOOLEAN DEFAULT FALSE NOT NULL,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
