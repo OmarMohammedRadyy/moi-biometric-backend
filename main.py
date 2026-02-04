@@ -2,6 +2,7 @@
 MOI Biometric System - FastAPI Backend
 Main application file with all API endpoints
 Using DeepFace for face recognition
+Build: 2026-02-04-v3.5
 """
 
 import os
