@@ -140,59 +140,8 @@ class EmbeddingsCache:
         return len(self._cache)
 
 
-class RateLimiter:
-    """Rate limiter for API security"""
-    def __init__(self):
-        self._requests: Dict[int, List[float]] = defaultdict(list)
-        self._failures: Dict[int, int] = defaultdict(int)
-        self._lockouts: Dict[int, float] = {}
-        self._lock = threading.Lock()
-    
-    def is_locked(self, user_id: int) -> Tuple[bool, int]:
-        """Check if user is locked out. Returns (is_locked, remaining_seconds)"""
-        with self._lock:
-            if user_id in self._lockouts:
-                remaining = self._lockouts[user_id] - time.time()
-                if remaining > 0:
-                    return True, int(remaining)
-                else:
-                    del self._lockouts[user_id]
-                    self._failures[user_id] = 0
-        return False, 0
-    
-    def check_rate_limit(self, user_id: int) -> Tuple[bool, str]:
-        """Check if request is within rate limits. Returns (allowed, message)"""
-        with self._lock:
-            now = time.time()
-            
-            # Clean old requests
-            self._requests[user_id] = [t for t in self._requests[user_id] if now - t < RATE_LIMIT_WINDOW]
-            
-            # Check rate limit
-            if len(self._requests[user_id]) >= MAX_SCANS_PER_MINUTE:
-                return False, f"تجاوزت الحد الأقصى ({MAX_SCANS_PER_MINUTE} مسح/دقيقة)"
-            
-            # Add request
-            self._requests[user_id].append(now)
-            return True, ""
-    
-    def record_failure(self, user_id: int):
-        """Record a failed scan attempt"""
-        with self._lock:
-            self._failures[user_id] += 1
-            if self._failures[user_id] >= MAX_FAILED_SCANS:
-                self._lockouts[user_id] = time.time() + LOCKOUT_DURATION
-                print(f"⚠️ User {user_id} locked out for {LOCKOUT_DURATION}s after {MAX_FAILED_SCANS} failures")
-    
-    def reset_failures(self, user_id: int):
-        """Reset failure count on successful scan"""
-        with self._lock:
-            self._failures[user_id] = 0
-
-
 # Initialize global instances
 embeddings_cache = EmbeddingsCache()
-rate_limiter = RateLimiter()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -248,169 +197,11 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # ==================== Enhanced Helper Functions ====================
 
-class ImageQualityResult:
-    """Result of image quality assessment"""
-    def __init__(self):
-        self.is_valid = True
-        self.brightness = 0
-        self.sharpness = 0
-        self.face_size = 0
-        self.face_confidence = 0
-        self.warnings: List[str] = []
-        self.errors: List[str] = []
-
-
-def assess_image_quality(image_path: str) -> ImageQualityResult:
+def get_face_embedding(image_path: str, with_quality_check: bool = False) -> Tuple[list, None]:
     """
-    Assess image quality for face recognition.
-    Checks: brightness, sharpness/blur, face size, face detection confidence
+    Generate face embedding using DeepFace - Fast mode.
+    Returns: (embedding, None)
     """
-    result = ImageQualityResult()
-    
-    try:
-        # Load image with OpenCV
-        img = cv2.imread(image_path)
-        if img is None:
-            result.is_valid = False
-            result.errors.append("فشل في قراءة الصورة")
-            return result
-        
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Check brightness
-        result.brightness = np.mean(gray)
-        if result.brightness < MIN_BRIGHTNESS:
-            result.warnings.append(f"الصورة مظلمة جداً (السطوع: {result.brightness:.0f})")
-        elif result.brightness > MAX_BRIGHTNESS:
-            result.warnings.append(f"الصورة ساطعة جداً (السطوع: {result.brightness:.0f})")
-        
-        # Check sharpness (Laplacian variance - lower = more blur)
-        result.sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if result.sharpness < MIN_SHARPNESS:
-            result.warnings.append(f"الصورة غير واضحة (الحدة: {result.sharpness:.0f})")
-        
-        # Try to detect face for size and confidence
-        try:
-            faces = DeepFace.extract_faces(
-                img_path=image_path,
-                detector_backend=DETECTOR_BACKEND,
-                enforce_detection=False
-            )
-            
-            if len(faces) == 0:
-                result.is_valid = False
-                result.errors.append("لم يتم اكتشاف وجه في الصورة")
-            elif len(faces) > 1:
-                result.is_valid = False
-                result.errors.append(f"تم اكتشاف {len(faces)} وجوه - يجب وجه واحد فقط")
-            else:
-                face = faces[0]
-                result.face_confidence = face.get('confidence', 0)
-                
-                # Get face region size
-                facial_area = face.get('facial_area', {})
-                face_width = facial_area.get('w', 0)
-                face_height = facial_area.get('h', 0)
-                result.face_size = min(face_width, face_height)
-                
-                if result.face_size < MIN_FACE_SIZE:
-                    result.warnings.append(f"الوجه صغير جداً ({result.face_size}px) - اقترب من الكاميرا")
-                
-                if result.face_confidence < MIN_FACE_CONFIDENCE:
-                    result.warnings.append(f"جودة اكتشاف الوجه منخفضة ({result.face_confidence:.1%})")
-        
-        except Exception as e:
-            result.warnings.append(f"تحذير في تحليل الوجه: {str(e)}")
-    
-    except Exception as e:
-        result.is_valid = False
-        result.errors.append(f"خطأ في تقييم جودة الصورة: {str(e)}")
-    
-    return result
-
-
-def detect_spoofing(image_path: str) -> Tuple[bool, float, str]:
-    """
-    Anti-spoofing detection using multiple techniques.
-    Returns: (is_real, confidence, message)
-    
-    Techniques used:
-    1. Texture analysis (LBP variance)
-    2. Color distribution analysis
-    3. Reflection detection
-    """
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            return False, 0.0, "فشل قراءة الصورة"
-        
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        
-        # 1. Texture analysis using Local Binary Pattern variance
-        # Real faces have more texture variation than printed photos
-        def compute_lbp_variance(image):
-            rows, cols = image.shape
-            lbp = np.zeros_like(image)
-            for i in range(1, rows - 1):
-                for j in range(1, cols - 1):
-                    center = image[i, j]
-                    code = 0
-                    code |= (image[i-1, j-1] >= center) << 7
-                    code |= (image[i-1, j] >= center) << 6
-                    code |= (image[i-1, j+1] >= center) << 5
-                    code |= (image[i, j+1] >= center) << 4
-                    code |= (image[i+1, j+1] >= center) << 3
-                    code |= (image[i+1, j] >= center) << 2
-                    code |= (image[i+1, j-1] >= center) << 1
-                    code |= (image[i, j-1] >= center) << 0
-                    lbp[i, j] = code
-            return np.var(lbp)
-        
-        # Simplified LBP for speed
-        lbp_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        texture_score = min(lbp_var / 500, 1.0)  # Normalize to 0-1
-        
-        # 2. Color distribution - real faces have specific skin color distribution
-        # Check saturation variance (printed photos often have less saturation variance)
-        sat_var = np.var(hsv[:, :, 1])
-        color_score = min(sat_var / 2000, 1.0)
-        
-        # 3. Specular reflection detection (screens/photos often have uniform lighting)
-        _, highlights = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY)
-        highlight_ratio = np.sum(highlights > 0) / highlights.size
-        reflection_score = 1.0 - min(highlight_ratio * 10, 1.0)
-        
-        # Combined score
-        final_score = (texture_score * 0.4 + color_score * 0.3 + reflection_score * 0.3)
-        
-        # Thresholds
-        is_real = final_score > 0.35
-        
-        if is_real:
-            return True, final_score, "تم التحقق من صحة الوجه"
-        else:
-            return False, final_score, "تحذير: قد تكون الصورة مزيفة (شاشة أو صورة مطبوعة)"
-    
-    except Exception as e:
-        # If anti-spoofing fails, allow but with warning
-        print(f"⚠️ Anti-spoofing check error: {e}")
-        return True, 0.5, "تعذر التحقق من صحة الوجه"
-
-
-def get_face_embedding(image_path: str, with_quality_check: bool = True) -> Tuple[list, ImageQualityResult]:
-    """
-    Generate face embedding using DeepFace with RetinaFace detector.
-    Returns: (embedding, quality_result)
-    """
-    quality_result = ImageQualityResult()
-    
-    # Quality check if enabled
-    if with_quality_check:
-        quality_result = assess_image_quality(image_path)
-        if not quality_result.is_valid:
-            raise ValueError("; ".join(quality_result.errors))
-    
     try:
         embedding_objs = DeepFace.represent(
             img_path=image_path,
@@ -425,7 +216,7 @@ def get_face_embedding(image_path: str, with_quality_check: bool = True) -> Tupl
         if len(embedding_objs) > 1:
             raise ValueError(f"تم اكتشاف {len(embedding_objs)} وجوه - يجب وجه واحد فقط")
         
-        return embedding_objs[0]["embedding"], quality_result
+        return embedding_objs[0]["embedding"], None
     
     except Exception as e:
         raise ValueError(f"فشل في تحليل الوجه: {str(e)}")
@@ -615,30 +406,11 @@ async def security_status(
     return {
         "face_model": FACE_MODEL,
         "detector_backend": DETECTOR_BACKEND,
-        "confidence_thresholds": {
-            "high": f"{(1-THRESHOLD_HIGH)*100:.0f}%+",
-            "medium": f"{(1-THRESHOLD_MEDIUM)*100:.0f}%+",
-            "low": f"{(1-THRESHOLD_LOW)*100:.0f}%+"
-        },
-        "security_features": {
-            "anti_spoofing": True,
-            "liveness_detection": True,
-            "image_quality_check": True,
-            "rate_limiting": {
-                "max_per_minute": MAX_SCANS_PER_MINUTE,
-                "lockout_after_failures": MAX_FAILED_SCANS,
-                "lockout_duration_seconds": LOCKOUT_DURATION
-            }
-        },
+        "match_threshold": f"{(1-MATCH_THRESHOLD)*100:.0f}%+",
+        "mode": "fast",
         "cache": {
             "embeddings_cached": embeddings_cache.size(),
             "needs_refresh": embeddings_cache.needs_refresh()
-        },
-        "image_quality_thresholds": {
-            "min_face_size_px": MIN_FACE_SIZE,
-            "min_brightness": MIN_BRIGHTNESS,
-            "max_brightness": MAX_BRIGHTNESS,
-            "min_sharpness": MIN_SHARPNESS
         }
     }
 
